@@ -265,6 +265,9 @@ class RFE:
                 real_step = _get_step(len_features, step)
                 k = len_features - real_step
 
+                if k <= 0:
+                    break
+
                 remaining_features = (
                     pl.LazyFrame(
                         {"importance": self.importance(state), "feature": features}
