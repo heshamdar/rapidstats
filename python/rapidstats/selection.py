@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import logging
 import math
 import pickle
 from collections.abc import Iterable
@@ -14,7 +15,10 @@ import polars as pl
 from polars.series.series import ArrayLike
 from tqdm.auto import tqdm
 
+from ._corr import correlation_matrix
 from .metrics import roc_auc
+
+logger = logging.getLogger(__name__)
 
 
 class Estimator(Protocol):
@@ -179,7 +183,7 @@ class RFE:
         n_features_to_select: float = 1,
         step: float = 1,
         importance: Callable[[RFEState], Iterable[float]] = _rfe_get_feature_importance,
-        callbacks: Optional[Iterable[Callable[[RFEState]]]] = None,
+        callbacks: Optional[Iterable[Callable[[RFEState], Any]]] = None,
         quiet: bool = False,
     ):
         self.unfit_estimator = estimator
@@ -347,7 +351,6 @@ class NFE:
         )
 
     def fit(self, X: nwt.IntoDataFrame, y: Any, **fit_kwargs):
-
         X_nw = nw.from_native(X, eager_only=True).pipe(self._add_noise)
 
         if "eval_set" in fit_kwargs:
@@ -377,6 +380,7 @@ class NFE:
                 )
             )
             .collect()["feature"]
+            .sort()
             .to_list()
         )
 
@@ -409,3 +413,103 @@ class NFE:
 
     def fit_transform(self, X: nwt.IntoDataFrame, y: Any, **fit_kwargs) -> Any:
         return self.fit(X, y, **fit_kwargs).transform(X, y, **fit_kwargs)
+
+
+class CFE:
+    def __init__(self, threshold: float = 0.99, seed: Optional[int] = 208):
+        self.threshold = threshold
+        self.seed = seed
+
+    @staticmethod
+    def _find_drop(corr_mat: nw.DataFrame, seed: Optional[int]) -> tuple[str, int]:
+        f1_counts = corr_mat.group_by("f1").agg(nw.len().alias("count_f1"))
+        f2_counts = corr_mat.group_by("f2").agg(nw.len().alias("count_f2"))
+
+        counts = (
+            f1_counts.join(f2_counts, left_on="f1", right_on="f2", how="full")
+            .with_columns(
+                nw.coalesce("f1", "f2").alias("feature"),
+                nw.sum_horizontal("count_f1", "count_f2").alias("count"),
+            )
+            .select("feature", "count")
+            .filter(nw.col("count").__eq__(nw.col("count").max()))
+            # We need to sort by "feature" because the order after the join is not
+            # always the same, making multiple runs even with the same seed not
+            # reproducible without the sort.
+            .sort("feature")
+            # We could take the first or last, but let's sample so that we don't
+            # introduce bias based on the alphabetical order.
+            .sample(1, seed=seed)
+        )
+
+        return (counts["feature"].item(), counts["count"].item())
+
+    def fit_from_correlation_matrix(
+        self, corr_mat: nwt.IntoFrame, index: str = "", transform: bool = True
+    ):
+        cm_nw = nw.from_native(corr_mat).lazy()
+
+        if transform:
+            cm_nw = cm_nw.unpivot(index=index).rename(
+                {index: "f1", "variable": "f2", "value": "correlation"}
+            )
+
+        features = (
+            nw.concat(
+                [
+                    cm_nw.select("f1").rename({"f1": "x"}),
+                    cm_nw.select("f2").rename({"f2": "x"}),
+                ],
+                how="vertical",
+            )
+            .unique()
+            .collect()["x"]
+            .to_list()
+        )
+
+        cm_nw = (
+            cm_nw.with_columns(nw.col("correlation").abs())
+            .filter(
+                nw.col("f1").__ne__(nw.col("f2")),
+                nw.col("correlation").is_null().__invert__(),
+                nw.col("correlation").is_nan().__invert__(),
+                nw.col("correlation").__ge__(self.threshold),
+            )
+            .collect()
+        )
+
+        drop_list = []
+        i = 0
+        while cm_nw.shape[0] > 0:
+            to_drop, count = self._find_drop(cm_nw, self.seed)
+
+            logger.info(
+                f"Iteration {i}: Dropping {to_drop}, correlated with {count} other features"
+            )
+
+            cm_nw = cm_nw.filter(
+                nw.col("f1")
+                .__eq__(to_drop)
+                .__or__(nw.col("f2").__eq__(to_drop))
+                .__invert__()
+            )
+
+            drop_list.append(to_drop)
+            i += 1
+
+        self.selected_features_ = sorted(list(set(features) - set(to_drop)))
+
+        return self
+
+    def fit(self, X: nwt.IntoFrame):
+        corr_mat = correlation_matrix(X)
+
+        self.fit_from_correlation_matrix(corr_mat)
+
+        return self
+
+    def transform(self, X: nwt.IntoFrameT) -> nwt.IntoFrameT:
+        return nw.from_native(X).select(self.selected_features_).to_native()
+
+    def fit_transform(self, X: nwt.IntoFrameT) -> nwt.IntoFrameT:
+        return self.fit(X).transform(X)
