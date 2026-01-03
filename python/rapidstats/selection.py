@@ -309,7 +309,7 @@ class NFE:
         self,
         estimator: Estimator,
         importance: Callable[[NFEState], ArrayLike] = _nfe_get_feature_importance,
-        seed: Optional[int] = None,
+        seed: Optional[int] = 208,
     ):
         self.unfit_estimator = estimator
         self.importance = importance
@@ -456,7 +456,7 @@ class CFE:
             drop_list.append(to_drop)
             i += 1
 
-        self.selected_features_ = sorted(list(set(features) - set(to_drop)))
+        self.selected_features_ = sorted(list(set(features) - set(drop_list)))
 
         return self
 
