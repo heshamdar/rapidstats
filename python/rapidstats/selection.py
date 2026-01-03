@@ -285,34 +285,11 @@ class RFE:
 
         return self
 
-    def transform(
-        self,
-        X: Optional[nwt.IntoDataFrame] = None,
-        y: Optional[Any] = None,
-        **fit_kwargs,
-    ) -> Any:
-        if X is None or y is None:
-            return self.estimator_
-
-        if "eval_set" in fit_kwargs:
-            fit_kwargs["eval_set"] = [
-                (
-                    nw.from_native(X_val).select(self.selected_features_).to_native(),
-                    y_val,
-                )
-                for X_val, y_val in fit_kwargs["eval_set"]
-            ]
-
-        return self.unfit_estimator.fit(
-            nw.from_native(X, eager_only=True)
-            .select(self.selected_features_)
-            .to_native(),
-            y,
-            **fit_kwargs,
-        )
+    def transform(self, X: nwt.IntoFrameT) -> nwt.IntoFrameT:
+        return nw.from_native(X).select(self.selected_features_).to_native()
 
     def fit_transform(self, X, y, **fit_kwargs) -> Any:
-        return self.fit(X, y, **fit_kwargs).transform()
+        return self.fit(X, y, **fit_kwargs).transform(X)
 
 
 class NFEState(TypedDict):
@@ -388,31 +365,13 @@ class NFE:
 
         return self
 
-    def transform(
-        self,
-        X: nwt.IntoDataFrame,
-        y: Any,
-        **fit_kwargs,
-    ) -> Any:
-        if "eval_set" in fit_kwargs:
-            fit_kwargs["eval_set"] = [
-                (
-                    nw.from_native(X_val).select(self.selected_features_).to_native(),
-                    y_val,
-                )
-                for X_val, y_val in fit_kwargs["eval_set"]
-            ]
+    def transform(self, X: nwt.IntoFrameT) -> nwt.IntoFrameT:
+        return nw.from_native(X).select(self.selected_features_).to_native()
 
-        return self.unfit_estimator.fit(
-            nw.from_native(X, eager_only=True)
-            .select(self.selected_features_)
-            .to_native(),
-            y,
-            **fit_kwargs,
-        )
-
-    def fit_transform(self, X: nwt.IntoDataFrame, y: Any, **fit_kwargs) -> Any:
-        return self.fit(X, y, **fit_kwargs).transform(X, y, **fit_kwargs)
+    def fit_transform(
+        self, X: nwt.IntoDataFrameT, y: Any, **fit_kwargs
+    ) -> nwt.IntoDataFrameT:
+        return self.fit(X, y, **fit_kwargs).transform(X)
 
 
 class CFE:
