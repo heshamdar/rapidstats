@@ -239,14 +239,14 @@ class RFE:
                     **fit_kwargs,
                 )
 
-                state = {
-                    "estimator": est,
-                    "X": X_loop,
-                    "y": y,
-                    "eval_set": fit_kwargs.get("eval_set", None),
-                    "features": features,
-                    "iteration": iteration,
-                }
+                state = RFEState(
+                    estimator=est,
+                    X=X_loop,
+                    y=y,
+                    eval_set=fit_kwargs.get("eval_set", None),
+                    features=features,
+                    iteration=iteration,
+                )
 
                 for callback in self.callbacks:
                     callback(state)
@@ -344,7 +344,7 @@ class NFE:
         X_train = X_nw.to_native()
         est = self.unfit_estimator.fit(X_train, y, **fit_kwargs)
 
-        state = {"estimator": est, "X": X_train, "y": y}
+        state = NFEState(estimator=est, X=X_train, y=y)
 
         nfe_features = (
             pl.LazyFrame(
