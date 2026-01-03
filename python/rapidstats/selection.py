@@ -281,7 +281,7 @@ class RFE:
                 pbar.update(1)
 
         self.estimator_ = est
-        self.selected_features_ = features
+        self.selected_features_ = sorted(features)
 
         return self
 
