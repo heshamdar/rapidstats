@@ -1,8 +1,8 @@
 import itertools
 from typing import Literal, Optional, Union
 
-import narwhals as nw
-import narwhals.typing as nwt
+import narwhals.stable.v1 as nw
+import narwhals.stable.v1.typing as nwt
 import polars as pl
 
 CorrelationMethod = Literal["pearson", "spearman"]

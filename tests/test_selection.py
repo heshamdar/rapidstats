@@ -94,6 +94,30 @@ def test_rfe(estimator):
     )
 
     assert rfe.selected_features_ == ["f0.99"]
+    assert rfe.transform(X).columns == ["f0.99"]
+
+
+@pytest.mark.parametrize("estimator", ESTIMATORS)
+def test_rfe_early_stopping(estimator):
+    fit_kwargs = {}
+    if "eval_set" in inspect.signature(estimator.fit).parameters:
+        fit_kwargs["eval_set"] = [(X, y)]
+
+    def _roc_auc(est, X, y) -> float:
+        return rs.metrics.roc_auc(y, est.predict(X))
+
+    early_stopping_kwargs = {}
+    if "predict_proba" not in inspect.getmembers(
+        estimator, predicate=inspect.isfunction
+    ):
+        early_stopping_kwargs["metric"] = _roc_auc
+
+    rs.selection.RFE(
+        estimator=estimator,
+        step=3,
+        quiet=True,
+        callbacks=[rs.selection.EarlyStopping(**early_stopping_kwargs)],
+    ).fit(X, y, **fit_kwargs)
 
 
 @pytest.mark.parametrize("estimator", ESTIMATORS)
@@ -105,3 +129,77 @@ def test_nfe(estimator):
     nfe = rs.selection.NFE(estimator=estimator, seed=SEED).fit(X, y, **fit_kwargs)
 
     assert "f0.99" in nfe.selected_features_
+    assert "f0.99" in nfe.transform(X).columns
+
+
+def test_cfe():
+    corr_mat = pl.DataFrame(
+        {
+            "": ["a", "b", "c"],
+            "a": [1.0, 0.5, 0.7],
+            "b": [-0.99, 1, 0.98],
+            "c": [float("nan"), None, 1],
+        }
+    )
+
+    expected = ["a", "c"]
+    cfe = rs.selection.CFE(threshold=0.95)
+
+    assert cfe.fit_from_correlation_matrix(corr_mat).selected_features_ == expected
+
+    corr_mat_unpivoted = corr_mat.unpivot(index="").rename(
+        {"": "f1", "variable": "f2", "value": "correlation"}
+    )
+
+    assert (
+        cfe.fit_from_correlation_matrix(
+            corr_mat_unpivoted, transform=False
+        ).selected_features_
+        == expected
+    )
+
+
+def test_cfe_identity_no_drop():
+    # Test that identity correlations do not cause a feature to be removed, i.e.
+    # corr(a, a) = 1 should not cause feature a to be dropped.
+    corr_mat = pl.DataFrame(
+        {
+            "": ["a", "b", "c"],
+            "a": [1.0, 0.5, 0.7],
+            "b": [0.5, 1.0, 0.98],
+            "c": [float("nan"), None, 1],
+        }
+    )
+
+    assert rs.selection.CFE(threshold=0.99).fit_from_correlation_matrix(
+        corr_mat
+    ).selected_features_ == ["a", "b", "c"]
+
+
+def test_cfe_corr_1_is_removed():
+    # Test that a correlation of 1 that is not an identity causes a feature to be
+    # correctly removed.
+    corr_mat = pl.DataFrame(
+        {
+            "": ["a", "b", "c"],
+            "a": [1.0, 0.5, 0.7],
+            "b": [0.5, 1.0, 1.0],
+            "c": [float("nan"), None, 1],
+        }
+    )
+
+    assert rs.selection.CFE(threshold=0.99).fit_from_correlation_matrix(
+        corr_mat
+    ).selected_features_ == ["a", "c"]
+
+
+def test_cfe_repro():
+    n_cols = 50
+    df = pl.DataFrame(
+        np.random.rand(1_000, n_cols), schema=[f"col_{i}" for i in range(n_cols)]
+    )
+
+    assert (
+        rs.selection.CFE().fit(df).selected_features_
+        == rs.selection.CFE().fit(df).selected_features_
+    )
