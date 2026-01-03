@@ -98,6 +98,29 @@ def test_rfe(estimator):
 
 
 @pytest.mark.parametrize("estimator", ESTIMATORS)
+def test_rfe_early_stopping(estimator):
+    fit_kwargs = {}
+    if "eval_set" in inspect.signature(estimator.fit).parameters:
+        fit_kwargs["eval_set"] = [(X, y)]
+
+    def _roc_auc(est, X, y) -> float:
+        return rs.metrics.roc_auc(y, est.predict(X))
+
+    early_stopping_kwargs = {}
+    if "predict_proba" not in inspect.getmembers(
+        estimator, predicate=inspect.isfunction
+    ):
+        early_stopping_kwargs["metric"] = _roc_auc
+
+    rs.selection.RFE(
+        estimator=estimator,
+        step=3,
+        quiet=True,
+        callbacks=[rs.selection.EarlyStopping(**early_stopping_kwargs)],
+    ).fit(X, y, **fit_kwargs)
+
+
+@pytest.mark.parametrize("estimator", ESTIMATORS)
 def test_nfe(estimator):
     fit_kwargs = {}
     if "eval_set" in inspect.signature(estimator.fit).parameters:
