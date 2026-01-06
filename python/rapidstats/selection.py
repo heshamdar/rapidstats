@@ -582,14 +582,17 @@ class CFE:
 
     @staticmethod
     def _find_drop(corr_mat: nw.DataFrame, seed: Optional[int]) -> tuple[str, int]:
-        f1_counts = corr_mat.group_by("f1").agg(nw.len().alias("count_f1"))
-        f2_counts = corr_mat.group_by("f2").agg(nw.len().alias("count_f2"))
+        c1 = "c1"
+        c2 = "c2"
+
+        c1_counts = corr_mat.group_by(c1).agg(nw.len().alias("count_c1"))
+        c2_counts = corr_mat.group_by(c2).agg(nw.len().alias("count_c2"))
 
         counts = (
-            f1_counts.join(f2_counts, left_on="f1", right_on="f2", how="full")
+            c1_counts.join(c2_counts, left_on=c1, right_on=c2, how="full")
             .with_columns(
-                nw.coalesce("f1", "f2").alias("feature"),
-                nw.sum_horizontal("count_f1", "count_f2").alias("count"),
+                nw.coalesce(c1, c2).alias("feature"),
+                nw.sum_horizontal("count_c1", "count_c2").alias("count"),
             )
             .select("feature", "count")
             .filter(nw.col("count").__eq__(nw.col("count").max()))
@@ -619,24 +622,26 @@ class CFE:
             Whether to transfrom the correlation matrix to long form. A wide form
             correlation matrix has columns that are features and an "index" that lists
             the features. If False, the correlation matrix must already be in long form
-            with at least 3 columns, "f1", "f2", and "correlation" , by default True
+            with at least 3 columns, "c1", "c2", and "correlation" , by default True
 
         Returns
         -------
         Self
         """
+        c1 = "c1"
+        c2 = "c2"
         cm_nw = nw.from_native(corr_mat).lazy()
 
         if transform:
             cm_nw = cm_nw.unpivot(index=index).rename(
-                {index: "f1", "variable": "f2", "value": "correlation"}
+                {index: c1, "variable": c2, "value": "correlation"}
             )
 
         features = (
             nw.concat(
                 [
-                    cm_nw.select("f1").rename({"f1": "x"}),
-                    cm_nw.select("f2").rename({"f2": "x"}),
+                    cm_nw.select(c1).rename({"c1": "x"}),
+                    cm_nw.select(c2).rename({"c2": "x"}),
                 ],
                 how="vertical",
             )
@@ -648,7 +653,7 @@ class CFE:
         cm_nw = (
             cm_nw.with_columns(nw.col("correlation").abs())
             .filter(
-                nw.col("f1").__ne__(nw.col("f2")),
+                nw.col(c1).__ne__(nw.col(c2)),
                 nw.col("correlation").is_null().__invert__(),
                 nw.col("correlation").is_nan().__invert__(),
                 nw.col("correlation").__ge__(self.threshold),
@@ -666,9 +671,9 @@ class CFE:
             )
 
             cm_nw = cm_nw.filter(
-                nw.col("f1")
+                nw.col(c1)
                 .__eq__(to_drop)
-                .__or__(nw.col("f2").__eq__(to_drop))
+                .__or__(nw.col(c2).__eq__(to_drop))
                 .__invert__()
             )
 

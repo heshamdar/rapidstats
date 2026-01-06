@@ -148,7 +148,7 @@ def test_cfe():
     assert cfe.fit_from_correlation_matrix(corr_mat).selected_features_ == expected
 
     corr_mat_unpivoted = corr_mat.unpivot(index="").rename(
-        {"": "f1", "variable": "f2", "value": "correlation"}
+        {"": "c1", "variable": "c2", "value": "correlation"}
     )
 
     assert (
