@@ -23,6 +23,7 @@ Y_PRED = Y_SCORE > 0.5
 Y_TRUE_SC = np.full(N_ROWS, True)
 Y_SCORE_SC = np.ones(N_ROWS)
 Y_PRED_SC = Y_SCORE_SC > 0.5
+Y_SCORE_INT = np.random.randint(low=300, high=850 + 1, size=N_ROWS)
 
 TRUE_PRED_COMBOS = [
     (Y_TRUE, Y_PRED),
@@ -34,6 +35,7 @@ TRUE_PRED_COMBOS = [
 TRUE_SCORE_COMBOS = [
     (Y_TRUE, Y_SCORE),
     (Y_TRUE_SC, Y_SCORE),
+    (Y_TRUE, Y_SCORE_INT),
 ]
 
 Y_TRUE_REG = np.random.rand(N_ROWS)
@@ -46,6 +48,23 @@ PROTECTED = np.random.choice([True, False], N_ROWS)
 CONTROL = ~PROTECTED
 
 THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+THRESHOLDS_INT = [400, 500, 600, 700, 800]
+
+SCORE_THRESHOLDS_COMBOS = [
+    (Y_SCORE, None),
+    (Y_SCORE, THRESHOLDS),
+    (Y_SCORE_INT, None),
+    (Y_SCORE_INT, THRESHOLDS_INT),
+]
+
+TRUE_SCORE_THRESHOLDS_COMBOS = [
+    (Y_TRUE, Y_SCORE, None),
+    (Y_TRUE, Y_SCORE, THRESHOLDS),
+    (Y_TRUE_SC, Y_SCORE, None),
+    (Y_TRUE_SC, Y_SCORE, THRESHOLDS),
+    (Y_TRUE, Y_SCORE_INT, None),
+    (Y_TRUE, Y_SCORE_INT, THRESHOLDS_INT),
+]
 
 
 def reference_f1(y_true, y_pred):
@@ -61,46 +80,56 @@ def reference_confusion_matrix(y_true, y_pred, beta: float = 1.0, sample_weight=
         y_true, y_pred, labels=[False, True], sample_weight=sample_weight
     ).ravel()
 
-    p = tp + fn_
-    n = fp + tn
-    tpr = tp / p
-    fnr = 1.0 - tpr
-    fpr = fp / n
-    tnr = 1.0 - fpr
-    precision = sklearn.metrics.precision_score(
-        y_true,
-        y_pred,
-        labels=[False, True],
-        zero_division=np.nan,
-        sample_weight=sample_weight,
-    )
-    false_omission_rate = fn_ / (fn_ + tn)
-    plr = tpr / fpr
-    nlr = fnr / tnr
-    npv = 1.0 - false_omission_rate
-    fdr = 1.0 - precision
-    prevalence = p / (p + n)
-    informedness = tpr + tnr - 1.0
-    prevalence_threshold = (np.sqrt(tpr * fpr) - fpr) / (tpr - fpr)
-    markedness = precision - false_omission_rate
-    dor = plr / nlr
-    balanced_accuracy = (tpr + tnr) / 2
-    fbeta = sklearn.metrics.fbeta_score(
-        y_true,
-        y_pred,
-        beta=beta,
-        labels=[False, True],
-        zero_division=np.nan,
-        sample_weight=sample_weight,
-    )
-    folkes_mallows_index = np.sqrt(precision * tpr)
-    mcc = np.sqrt(tpr * tnr * precision * npv) - np.sqrt(
-        fnr * fpr * false_omission_rate * fdr
-    )
-    acc = sklearn.metrics.accuracy_score(y_true, y_pred, sample_weight=sample_weight)
-    threat_score = tp / (tp + fn_ + fp)
-    ppr = (tp + fp) / (p + n)
-    pnr = (tn + fn_) / (p + n)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        p = tp + fn_
+        n = fp + tn
+        tpr = tp / p
+        fnr = 1.0 - tpr
+        fpr = fp / n
+        tnr = 1.0 - fpr
+        precision = sklearn.metrics.precision_score(
+            y_true,
+            y_pred,
+            labels=[False, True],
+            zero_division=np.nan,
+            sample_weight=sample_weight,
+        )
+        false_omission_rate = fn_ / (fn_ + tn)
+        plr = tpr / fpr
+        nlr = fnr / tnr
+        npv = 1.0 - false_omission_rate
+        fdr = 1.0 - precision
+        prevalence = p / (p + n)
+        informedness = tpr + tnr - 1.0
+        prevalence_threshold = (np.sqrt(tpr * fpr) - fpr) / (tpr - fpr)
+        markedness = precision - false_omission_rate
+        dor = plr / nlr
+        balanced_accuracy = (tpr + tnr) / 2
+        fbeta = sklearn.metrics.fbeta_score(
+            y_true,
+            y_pred,
+            beta=beta,
+            labels=[False, True],
+            zero_division=np.nan,
+            sample_weight=sample_weight,
+        )
+
+        # sklearn uses tp and fp directly, so even though precision is 0 and tpr is 0
+        # fbeta can be 0 instead of nan. We use precision and recall directly so if
+        # both are 0 we get null.
+        if precision == 0 and tpr == 0:
+            fbeta = np.nan
+
+        folkes_mallows_index = np.sqrt(precision * tpr)
+        mcc = np.sqrt(tpr * tnr * precision * npv) - np.sqrt(
+            fnr * fpr * false_omission_rate * fdr
+        )
+        acc = sklearn.metrics.accuracy_score(
+            y_true, y_pred, sample_weight=sample_weight
+        )
+        threat_score = tp / (tp + fn_ + fp)
+        ppr = (tp + fp) / (p + n)
+        pnr = (tn + fn_) / (p + n)
 
     return ConfusionMatrix(
         *[
@@ -254,7 +283,13 @@ def test_max_ks(y_true, y_score):
     assert pytest.approx(fs, nan_ok=True) == ref
 
 
-@pytest.mark.parametrize("y_true,y_score", TRUE_SCORE_COMBOS)
+@pytest.mark.parametrize(
+    "y_true,y_score",
+    [
+        (Y_TRUE, Y_SCORE),
+        (Y_TRUE_SC, Y_SCORE),
+    ],
+)
 def test_brier_loss(y_true, y_score):
     ref = sklearn.metrics.brier_score_loss(y_true, y_score)
     res = rs.metrics.brier_loss(y_true, y_score)
@@ -288,7 +323,7 @@ def reference_confusion_matrix_at_thresholds(
     y_true, y_score, beta, sample_weight, thresholds
 ) -> pl.DataFrame:
     if thresholds is None:
-        thresholds = y_score
+        thresholds = pl.Series(y_score).unique().to_list()
     cms = []
     for t in thresholds:
         cms.append(
@@ -309,10 +344,12 @@ def reference_confusion_matrix_at_thresholds(
     ],
 )
 @pytest.mark.parametrize("loop_strategy", ["loop", "cum_sum"])
-@pytest.mark.parametrize("thresholds", [None, THRESHOLDS])
-def test_confusion_matrix_at_thresholds(beta, sample_weight, loop_strategy, thresholds):
-    y_true = Y_TRUE
-    y_score = Y_SCORE
+@pytest.mark.parametrize("y_true,y_score,thresholds", TRUE_SCORE_THRESHOLDS_COMBOS)
+def test_confusion_matrix_at_thresholds(
+    y_true, y_score, thresholds, beta, sample_weight, loop_strategy
+):
+    # y_true = Y_TRUE
+    # y_score = Y_SCORE
 
     ref = (
         reference_confusion_matrix_at_thresholds(
@@ -356,7 +393,8 @@ def reference_adverse_impact_ratio(
     c = df.filter(pl.col("control"))
     appr_rate_control = np.average(c["approved"], weights=c["sample_weight"])
 
-    res = float(appr_rate_protected / appr_rate_control)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        res = float(appr_rate_protected / appr_rate_control)
 
     if math.isfinite(res):
         return res
@@ -368,7 +406,7 @@ def reference_adverse_impact_ratio_at_thresholds(
     y_score, protected, control, sample_weight, thresholds
 ):
     if thresholds is None:
-        thresholds = y_score
+        thresholds = set(y_score)
 
     res = {"threshold": [], "air": []}
     for t in thresholds:
@@ -410,11 +448,13 @@ def test_adverse_impact_ratio(sample_weight):
 
 
 @pytest.mark.parametrize("sample_weight", [None, SAMPLE_WEIGHT])
-@pytest.mark.parametrize("thresholds", [None, THRESHOLDS])
+@pytest.mark.parametrize("y_score,thresholds", SCORE_THRESHOLDS_COMBOS)
 @pytest.mark.parametrize("strategy", ["loop", "cum_sum"])
-def test_adverse_impact_ratio_at_thresholds(sample_weight, thresholds, strategy):
+def test_adverse_impact_ratio_at_thresholds(
+    y_score, thresholds, strategy, sample_weight
+):
     ref = reference_adverse_impact_ratio_at_thresholds(
-        Y_SCORE,
+        y_score,
         protected=PROTECTED,
         control=CONTROL,
         sample_weight=sample_weight,
@@ -422,7 +462,7 @@ def test_adverse_impact_ratio_at_thresholds(sample_weight, thresholds, strategy)
     ).sort("threshold")
 
     res = rs.metrics.adverse_impact_ratio_at_thresholds(
-        Y_SCORE,
+        y_score,
         protected=PROTECTED,
         control=CONTROL,
         sample_weight=sample_weight,
@@ -437,7 +477,7 @@ def reference_predicted_positive_ratio_at_thresholds(
     y_score, sample_weight, thresholds
 ) -> pl.DataFrame:
     if thresholds is None:
-        thresholds = y_score
+        thresholds = set(y_score)
 
     res = {"threshold": [], "ppr": []}
     for t in thresholds:
@@ -453,14 +493,16 @@ def reference_predicted_positive_ratio_at_thresholds(
 
 
 @pytest.mark.parametrize("sample_weight", [None, SAMPLE_WEIGHT])
-@pytest.mark.parametrize("thresholds", [None, THRESHOLDS])
+@pytest.mark.parametrize("y_score,thresholds", SCORE_THRESHOLDS_COMBOS)
 @pytest.mark.parametrize("strategy", ["loop", "cum_sum"])
-def test_predicted_positive_ratio_at_thresholds(sample_weight, thresholds, strategy):
+def test_predicted_positive_ratio_at_thresholds(
+    y_score, thresholds, strategy, sample_weight
+):
     ref = reference_predicted_positive_ratio_at_thresholds(
-        Y_SCORE, sample_weight=sample_weight, thresholds=thresholds
+        y_score, sample_weight=sample_weight, thresholds=thresholds
     ).sort("threshold")
     res = rs.metrics.predicted_positive_ratio_at_thresholds(
-        Y_SCORE, sample_weight=sample_weight, thresholds=thresholds, strategy=strategy
+        y_score, sample_weight=sample_weight, thresholds=thresholds, strategy=strategy
     ).sort("threshold")
 
     polars.testing.assert_series_equal(ref["ppr"], res["ppr"])
