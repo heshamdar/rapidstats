@@ -1,4 +1,4 @@
-use crate::distributions::{self, poisson};
+use crate::distributions;
 use polars::prelude::*;
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -89,39 +89,137 @@ impl VecUtils for Vec<f64> {
 //     res
 // }
 
+/// Worker stack size for the bootstrap pool.
+///
+/// Each bootstrap task calls into polars, which parallelises internally on its own rayon
+/// pool. That nesting is executed on the calling worker's stack, and rayon's 2 MiB
+/// default is not enough: past a few thousand iterations it overflows and takes the
+/// interpreter down with a SIGSEGV. This reproduced on v0.4.1 at the *default* 1000
+/// iterations for `Bootstrap(sampling_method="poisson").roc_auc(...)`.
+///
+/// 16 MiB is what the crash was empirically shown to need; stacks are virtual
+/// allocations, so the headroom costs address space rather than resident memory.
+const BOOTSTRAP_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 fn create_rayon_pool(n_jobs: usize) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
         .num_threads(n_jobs)
+        .stack_size(BOOTSTRAP_STACK_SIZE)
         .build()
         .unwrap()
+}
+
+/// A dedicated pool for bootstrap work, built once.
+///
+/// Bootstrapping deliberately does not run on rayon's global pool: that is the pool
+/// polars nests onto, and its workers carry the too-small default stack. Running the
+/// outer loop on our own pool lets us set the stack size, and keeps a long bootstrap
+/// from monopolising the pool polars uses for everything else.
+fn bootstrap_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+    POOL.get_or_init(|| {
+        let n_jobs = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        create_rayon_pool(n_jobs)
+    })
 }
 
 fn sample(df: DataFrame, df_height: usize, seed: Option<u64>) -> DataFrame {
     df.sample_n_literal(df_height, true, false, seed).unwrap()
 }
 
-fn poisson_sample(df: DataFrame, df_height: usize, seed: Option<u64>) -> DataFrame {
-    let repeats = Series::new("repeats".into(), poisson(1.0, df_height, seed));
-
-    let index_col = Selector::ByName {
-        names: Arc::from(vec![PlSmallStr::from("index")].into_boxed_slice()),
-        strict: true,
+/// Apply resample multiplicities as weights instead of materialising the resample.
+///
+/// Drawing row `i` exactly `c[i]` times and computing a weight-aware metric is
+/// arithmetically identical to computing it once with `sample_weight * c`. Using that
+/// identity avoids building a new frame per iteration, and -- because row order is
+/// untouched -- lets a pre-sorted frame be sorted once for the whole bootstrap rather
+/// than once per iteration.
+///
+/// Frames reaching here always carry a `sample_weight` column: the Python layer adds one
+/// (defaulting to 1.0) in `_y_true_y_score_to_df` and friends. Frames without one -- the
+/// regression metrics and `mean` -- are handled by the caller, which falls back to
+/// materialising.
+fn weight_sample(df: DataFrame, df_height: usize, seed: Option<u64>, poisson: bool) -> DataFrame {
+    let counts: Vec<f64> = if poisson {
+        // Qualified: the `poisson` parameter shadows the imported function.
+        distributions::poisson(1.0, df_height, seed)
+            .into_iter()
+            .map(|c| c as f64)
+            .collect()
+    } else {
+        multinomial_counts(df_height, seed)
     };
 
-    df.lazy()
-        .with_row_index("index", Some(0))
-        .with_column(repeats.lit())
-        .with_column(col("index").repeat_by(col("repeats")))
-        .explode(index_col.clone())
-        .drop_nulls(Some(index_col))
-        .drop(Selector::ByName {
-            names: Arc::from(
-                vec![PlSmallStr::from("index"), PlSmallStr::from("repeats")].into_boxed_slice(),
-            ),
-            strict: true,
-        })
-        .collect()
-        .unwrap()
+    // Deliberately eager ChunkedArray arithmetic rather than `df.lazy()...collect()`.
+    // This runs inside a rayon `par_iter`, and re-entering the polars query engine from
+    // a rayon worker lets the engine's own pool steal work recursively; deep enough
+    // nesting overflows the worker stack and segfaults the interpreter. A plain
+    // elementwise multiply avoids the engine entirely -- and is faster besides.
+    let counts = Float64Chunked::from_vec("__rapidstats_resample_count__".into(), counts);
+    let weighted = df
+        .column("sample_weight")
+        .expect("checked by `resample_fn`")
+        .f64()
+        .expect("`sample_weight` is always Float64")
+        * &counts;
+
+    let mut out = df;
+    out.with_column(weighted.into_series().with_name("sample_weight".into()))
+        .expect("replacing a column with one of equal length");
+
+    out
+}
+
+/// Multiplicities from sampling `n` rows with replacement, i.e. a Multinomial(n, 1/n)
+/// draw, produced by counting `n` uniform draws over the row indices.
+fn multinomial_counts(n: usize, seed: Option<u64>) -> Vec<f64> {
+    use rand::Rng;
+    use rand::SeedableRng;
+
+    let seed = seed.unwrap_or_else(|| rand::thread_rng().gen());
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    let mut counts = vec![0.0f64; n];
+    for _ in 0..n {
+        counts[rng.gen_range(0..n)] += 1.0;
+    }
+
+    counts
+}
+
+fn poisson_sample(df: DataFrame, df_height: usize, seed: Option<u64>) -> DataFrame {
+    // Was `with_row_index` + `repeat_by` + `explode` through the lazy engine. That
+    // re-entered polars' query engine from inside a rayon worker, which could recurse
+    // deeply enough to overflow the worker stack and segfault the interpreter -- at the
+    // default 1000 iterations, on the default `roc_auc` path. Expanding the counts to
+    // gather indices and taking them is eager, engine-free, and faster.
+    let indices = distributions::poisson_repeat_indices(1.0, df_height, seed);
+    let idx = IdxCa::from_vec("".into(), indices);
+
+    df.take(&idx).expect("indices are all < df.height()")
+}
+
+/// Pick the resampling strategy.
+///
+/// `weights` is only honoured when the frame actually has a `sample_weight` column;
+/// otherwise the identity does not apply and we fall back to materialising, so callers
+/// never silently get an unresampled statistic.
+fn resample_fn(
+    df: &DataFrame,
+    poisson: bool,
+    weights: bool,
+) -> Box<dyn Fn(DataFrame, usize, Option<u64>) -> DataFrame + Send + Sync> {
+    if weights && df.column("sample_weight").is_ok() {
+        Box::new(move |d, h, s| weight_sample(d, h, s, poisson))
+    } else if poisson {
+        Box::new(poisson_sample)
+    } else {
+        Box::new(sample)
+    }
 }
 
 fn bootstrap_core<T: Send + Sync, F>(
@@ -131,6 +229,7 @@ fn bootstrap_core<T: Send + Sync, F>(
     func: F,
     chunksize: Option<usize>,
     poisson: bool,
+    weights: bool,
 ) -> Vec<T>
 where
     F: Fn(DataFrame) -> T + Send + Sync,
@@ -139,7 +238,7 @@ where
 
     let seeds: Vec<u64> = (0..iterations).collect();
 
-    let sample_func = if poisson { poisson_sample } else { sample };
+    let sample_func = resample_fn(&df, poisson, weights);
 
     let res: Vec<T> = if chunksize.is_none() {
         seeds
@@ -182,14 +281,15 @@ pub fn run_bootstrap<T: Send + Sync, F>(
     n_jobs: Option<usize>,
     chunksize: Option<usize>,
     poisson: bool,
+    weights: bool,
 ) -> Vec<T>
 where
     F: Fn(DataFrame) -> T + Send + Sync,
 {
     let df_height = df.height();
-    let sample_func = if poisson { poisson_sample } else { sample };
 
     let bootstrap_stats: Vec<T> = if n_jobs == Some(1) {
+        let sample_func = resample_fn(&df, poisson, weights);
         (0..iterations)
             .map(|i| {
                 func(sample_func(
@@ -200,10 +300,11 @@ where
             })
             .collect()
     } else if n_jobs.is_none() {
-        bootstrap_core(df, iterations, seed, func, chunksize, poisson)
+        bootstrap_pool()
+            .install(|| bootstrap_core(df, iterations, seed, func, chunksize, poisson, weights))
     } else {
         create_rayon_pool(n_jobs.unwrap())
-            .install(|| bootstrap_core(df, iterations, seed, func, chunksize, poisson))
+            .install(|| bootstrap_core(df, iterations, seed, func, chunksize, poisson, weights))
     };
 
     bootstrap_stats
@@ -215,12 +316,16 @@ where
 {
     let df_height = df.height();
     let index = ChunkedArray::new("index".into(), 0..df_height as u64);
-    let jacknife_stats: Vec<T> = (0..df_height)
-        .into_par_iter()
-        .map(|i| func(df.filter(&index.not_equal(i)).unwrap()))
-        .collect();
 
-    jacknife_stats
+    // Same reasoning as `run_bootstrap`: this nests polars work inside rayon tasks, and
+    // the jackknife runs one task per row, so it hits the deep end sooner than the
+    // bootstrap does.
+    bootstrap_pool().install(|| {
+        (0..df_height)
+            .into_par_iter()
+            .map(|i| func(df.filter(&index.not_equal(i)).unwrap()))
+            .collect()
+    })
 }
 
 pub fn standard_interval(

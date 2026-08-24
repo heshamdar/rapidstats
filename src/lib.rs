@@ -29,7 +29,7 @@ macro_rules! generate_functions {
 
         paste! {
             #[pyfunction]
-            #[pyo3(signature = (df, iterations, alpha, method, seed = None, n_jobs = None, chunksize = None, poisson = true))]
+            #[pyo3(signature = (df, iterations, alpha, method, seed = None, n_jobs = None, chunksize = None, poisson = true, weights = true))]
             fn [<_bootstrap $func_name>] (
                 py: Python<'_>,
                 df: PyDataFrame,
@@ -40,6 +40,7 @@ macro_rules! generate_functions {
                 n_jobs: Option<usize>,
                 chunksize: Option<usize>,
                 poisson: bool,
+                weights: bool,
             ) -> PyResult<bootstrap::ConfidenceInterval> {
                 let df: DataFrame = df.into();
                 // `method` borrows Python-owned memory, which cannot cross into
@@ -49,7 +50,7 @@ macro_rules! generate_functions {
                 py.allow_threads(move || {
                     let original_stat = $metric_func(df.clone());
                     let bootstrap_stats =
-                        bootstrap::run_bootstrap(df.clone(), iterations, seed, $metric_func, n_jobs, chunksize, poisson);
+                        bootstrap::run_bootstrap(df.clone(), iterations, seed, $metric_func, n_jobs, chunksize, poisson, weights);
                     if method == "standard" {
                         Ok(bootstrap::standard_interval(original_stat, bootstrap_stats, alpha))
                     }
@@ -93,7 +94,7 @@ fn _confusion_matrix(
 }
 
 #[pyfunction]
-#[pyo3(signature = (df, beta, iterations, alpha, method, seed = None, n_jobs = None, chunksize = None, poisson = true))]
+#[pyo3(signature = (df, beta, iterations, alpha, method, seed = None, n_jobs = None, chunksize = None, poisson = true, weights = true))]
 fn _bootstrap_confusion_matrix(
     py: Python<'_>,
     df: PyDataFrame,
@@ -105,13 +106,14 @@ fn _bootstrap_confusion_matrix(
     n_jobs: Option<usize>,
     chunksize: Option<usize>,
     poisson: bool,
+    weights: bool,
 ) -> PyResult<Vec<bootstrap::ConfidenceInterval>> {
     let df: DataFrame = df.into();
     let method = method.to_owned();
 
     Ok(py.allow_threads(move || {
         metrics::bootstrap_confusion_matrix(
-            df, beta, iterations, alpha, &method, seed, n_jobs, chunksize, poisson,
+            df, beta, iterations, alpha, &method, seed, n_jobs, chunksize, poisson, weights,
         )
     }))
 }

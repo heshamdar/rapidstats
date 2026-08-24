@@ -113,6 +113,7 @@ pub fn bootstrap_confusion_matrix(
     n_jobs: Option<usize>,
     chunksize: Option<usize>,
     poisson: bool,
+    weights: bool,
 ) -> Vec<bootstrap::ConfidenceInterval> {
     let base_cm = base_confusion_matrix(df);
 
@@ -124,6 +125,7 @@ pub fn bootstrap_confusion_matrix(
         n_jobs,
         chunksize,
         poisson,
+        weights,
     );
     let bs_transposed = transpose_confusion_matrix_results(bootstrap_stats);
 
