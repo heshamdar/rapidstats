@@ -19,23 +19,37 @@ def _alpha(confidence_level: float) -> float:
     return (1 - confidence_level) / 2
 
 
-def reference_standard_interval(bootstrap_stats, confidence_level):
+def reference_standard_interval(point, bootstrap_stats, confidence_level):
+    r"""The first-order normal approximation: \hat{\theta} +/- z * \hat{\sigma}.
+
+    Centred on the observed statistic, which is what the class docstring specifies and
+    what is reported as the point estimate. The implementation used to centre on the
+    bootstrap *mean* instead, so on a skewed bootstrap distribution the reported point
+    sat off-centre in its own interval -- measured at 0.014 off for a bootstrapped
+    ROC-AUC. This reference moved with that fix.
+    """
     alpha = _alpha(confidence_level)
 
-    mean = np.mean(bootstrap_stats)
-    stdev = np.std(bootstrap_stats, ddof=1)
-    stderr = stdev
-    z = scipy.stats.norm.ppf(1 - alpha)
-    x = z * stderr
+    stderr = np.std(bootstrap_stats, ddof=1)
+    x = scipy.stats.norm.ppf(1 - alpha) * stderr
 
-    return (mean - x, mean + x)
+    return (point - x, point + x)
 
 
 def test_standard_interval():
     rs = rapidstats._bootstrap._standard_interval(POINT, BOOTSTRAP_STATS, ALPHA)
-    ref = reference_standard_interval(BOOTSTRAP_STATS, CONFIDENCE_LEVEL)
+    ref = reference_standard_interval(POINT, BOOTSTRAP_STATS, CONFIDENCE_LEVEL)
 
     assert pytest.approx((rs[0], rs[2])) == ref
+
+
+def test_standard_interval_is_symmetric_about_the_point():
+    lower, point, upper = rapidstats._bootstrap._standard_interval(
+        POINT, BOOTSTRAP_STATS, ALPHA
+    )
+
+    assert point == POINT
+    assert (lower + upper) / 2 == pytest.approx(POINT)
 
 
 def reference_percentile_interval(bootstrap_stats, confidence_level):

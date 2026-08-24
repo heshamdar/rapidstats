@@ -150,25 +150,35 @@ def _jacknife(df: pl.DataFrame, stat_func, **executor_kwargs) -> list:
 
 
 def _standard_interval_polars(lf: LazyGroupBy, alpha: float) -> pl.LazyFrame:
+    """Half-width `z * sigma_hat` per group.
+
+    Only the half-width, because the interval is centred on the point estimate and that
+    is not available until this is joined against the original statistics -- see
+    `_centre_standard_interval_on_point`. It previously centred on the bootstrap mean
+    while reporting the point estimate as the point, which put the reported point
+    off-centre in its own interval on any skewed bootstrap distribution.
+    """
     z = norm.ppf(1 - alpha)
 
-    return (
-        lf.agg(
-            pl.col("value").mean().alias("mean"),
-            pl.col("value").std().alias("std"),
-        )
-        .with_columns(pl.col("std").mul(z).alias("x"))
-        .with_columns(
-            pl.col("mean").sub(pl.col("x")).alias("lower"),
-            pl.col("mean").add(pl.col("x")).alias("upper"),
-        )
+    return lf.agg(pl.col("value").std().mul(z).alias("x"))
+
+
+def _centre_standard_interval_on_point(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Turn the half-width into bounds around `point`. Apply after joining `original`."""
+    return lf.with_columns(
+        pl.col("point").sub(pl.col("x")).alias("lower"),
+        pl.col("point").add(pl.col("x")).alias("upper"),
     )
 
 
 def _percentile_interval_polars(lf: LazyGroupBy, alpha: float) -> pl.LazyFrame:
+    # `interpolation="linear"` is not the polars default ("nearest"), but it is what
+    # Rust's `percentile` -- and numpy, and scipy -- mean by a percentile. Without it the
+    # scalar bootstraps and the cum_sum bootstraps reported bounds under two different
+    # definitions of the same quantity.
     return lf.agg(
-        pl.col("value").quantile(alpha).alias("lower"),
-        pl.col("value").quantile(1 - alpha).alias("upper"),
+        pl.col("value").quantile(alpha, interpolation="linear").alias("lower"),
+        pl.col("value").quantile(1 - alpha, interpolation="linear").alias("upper"),
     )
 
 
@@ -807,6 +817,7 @@ class Bootstrap:
                         how="left",
                         validate="1:1",
                     )
+                    .pipe(_centre_standard_interval_on_point)
                     .select(final_cols)
                     .pipe(_collect)
                 )
@@ -1260,6 +1271,7 @@ class Bootstrap:
                 return (
                     _standard_interval_polars(lf, self.alpha)
                     .join(original, on="threshold", how="left", validate="1:1")
+                    .pipe(_centre_standard_interval_on_point)
                     .select(final_cols)
                     .pipe(_collect)
                 )

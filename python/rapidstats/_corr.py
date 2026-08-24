@@ -13,6 +13,15 @@ from tqdm.auto import tqdm
 
 from ._utils import _collect
 
+# Internal column names for the long form. Prefixed because they are pivoted on, and a
+# user column of the same name collides with the pivot index -- an input column literally
+# called "c2" used to raise `DuplicateError: column with name 'c2' has more than one
+# occurrence` from the batched path. They are renamed to the public `c1`/`c2` on the way
+# out, so the returned schema is unchanged.
+_C1 = "__rapidstats_c1__"
+_C2 = "__rapidstats_c2__"
+_CORR = "__rapidstats_correlation__"
+
 CorrelationMethod = Literal["pearson", "spearman"]
 CorrelationMatrixFormat = Literal["wide", "long"]
 
@@ -114,12 +123,12 @@ def _correlation_matrix(
         .unpivot()
         .with_columns(pl.col("variable").str.split("_"))
         .with_columns(
-            pl.col("variable").list.get(0).alias("c1"),
-            pl.col("variable").list.get(1).alias("c2"),
+            pl.col("variable").list.get(0).alias(_C1),
+            pl.col("variable").list.get(1).alias(_C2),
         )
         .drop("variable")
-        .rename({"value": "correlation"})
-        .select("c1", "c2", "correlation")
+        .rename({"value": _CORR})
+        .select(_C1, _C2, _CORR)
         .pipe(_collect)
     )
 
@@ -127,9 +136,9 @@ def _correlation_matrix(
         # Why do this contortion to rename things? I think I thought that replace might
         # be slow if I rename the long dataframe. I don't know if that's actually true
         # though...
-        corr_mat = corr_mat.pivot(index="c2", on="c1", values="correlation")
-        new_row_names = corr_mat["c2"]
-        corr_mat = corr_mat.drop("c2")
+        corr_mat = corr_mat.pivot(index=_C2, on=_C1, values=_CORR)
+        new_row_names = corr_mat[_C2]
+        corr_mat = corr_mat.drop(_C2)
 
         # Set the column names
         valid_old_names = [new_to_old_mapper[c] for c in corr_mat.columns]
@@ -144,9 +153,9 @@ def _correlation_matrix(
         return corr_mat
     elif format == "long":
         return corr_mat.with_columns(
-            pl.col("c1").replace_strict(new_to_old_mapper),
-            pl.col("c2").replace_strict(new_to_old_mapper),
-        )
+            pl.col(_C1).replace_strict(new_to_old_mapper),
+            pl.col(_C2).replace_strict(new_to_old_mapper),
+        ).rename({_C1: "c1", _C2: "c2", _CORR: "correlation"})
     else:
         raise ValueError(f"Unexpected format {format}")
 
@@ -192,7 +201,11 @@ def _batched_correlation_matrix(
     combinations = list(combinations)
 
     if 0 < batch_size < 1:
-        batch_size = int(len(combinations) / batch_size)
+        # A fraction is a *share* of the combinations, so multiply. This divided, which
+        # made `batch_size=0.1` produce a batch ten times larger than the whole job:
+        # everything landed in a single file and batching -- whose entire purpose is to
+        # bound memory on wide frames -- silently did nothing.
+        batch_size = max(1, int(len(combinations) * batch_size))
 
     if isinstance(batch_size, float):
         raise ValueError(
@@ -216,16 +229,23 @@ def _batched_correlation_matrix(
 
         corr_mat.write_parquet(cache_dir / f"{i}.parquet")
 
-    corr_mats = []
-    for f in cache_dir.glob("*.parquet"):
-        corr_mat = pl.scan_parquet(f)
-        corr_mats.append(corr_mat)
+    # Numeric order, not `glob`'s lexicographic order, which interleaves as
+    # 0, 1, 10, 11, 2, ... Batch order determines the order pairs appear in the
+    # concatenated long frame, which in turn determines the pivoted column order -- so
+    # sorting wrongly here silently transposes the matrix relative to the unbatched
+    # result. Only visible now that `batch_size` produces more than one batch.
+    corr_mats = [
+        pl.scan_parquet(f)
+        for f in sorted(cache_dir.glob("*.parquet"), key=lambda f: int(f.stem))
+    ]
 
     corr_mat = pl.concat(corr_mats, how="vertical_relaxed").pipe(_collect)
 
     if format == "wide":
-        corr_mat = corr_mat.pivot(on="c1", index="c2", values="correlation").rename(
-            {"c2": index}
+        corr_mat = (
+            corr_mat.rename({"c1": _C1, "c2": _C2, "correlation": _CORR})
+            .pivot(on=_C1, index=_C2, values=_CORR)
+            .rename({_C2: index})
         )
 
     if delete_ok and cache_dir.exists():

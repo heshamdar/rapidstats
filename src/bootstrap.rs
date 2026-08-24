@@ -334,12 +334,16 @@ pub fn standard_interval(
     alpha: f64,
 ) -> ConfidenceInterval {
     let runs = bootstrap_stats.drop_nans();
-    let mean = runs.mean();
     let stderr = runs.std();
     let z = distributions::norm_ppf(1.0 - alpha);
     let x = z * stderr;
 
-    (mean - x, original_stat, mean + x)
+    // Centred on the point estimate, per the documented interval
+    // `theta_hat +/- z * sigma_hat`. This used the bootstrap *mean* as the centre while
+    // still reporting `original_stat` as the point, so on a skewed bootstrap
+    // distribution the reported point sat off-centre in its own interval -- and could
+    // fall outside it.
+    (original_stat - x, original_stat, original_stat + x)
 }
 
 pub fn percentile_interval(

@@ -368,7 +368,7 @@ def predicted_positive_ratio_at_thresholds(
         }
     ).drop_nulls()
 
-    strategy = _set_loop_strategy(y_score, strategy)
+    strategy = _set_loop_strategy(thresholds, strategy)
 
     if strategy == "loop":
         df = lf.pipe(_collect)
@@ -968,7 +968,14 @@ def confusion_matrix_at_thresholds(
     strategy = _set_loop_strategy(thresholds, strategy)
 
     if strategy == "loop":
-        df = _y_true_y_score_to_df(y_true, y_score)
+        # Nulls must be dropped jointly across all three inputs. This built the frame
+        # from `y_true`/`y_score` alone and then passed the *original* full-length
+        # `sample_weight` into each call, so a single null raised `ShapeError: height of
+        # column 'sample_weight' (5) does not match height of column 'y_true' (4)` --
+        # and, had the lengths happened to match, would have shifted every weight after
+        # the null onto the wrong row.
+        df = _y_true_y_score_to_df(y_true, y_score, sample_weight)
+        weights = df["sample_weight"]
 
         def _cm(t):
             return (
@@ -976,7 +983,7 @@ def confusion_matrix_at_thresholds(
                     df["y_true"],
                     df["y_score"].ge(t),
                     beta=beta,
-                    sample_weight=sample_weight,
+                    sample_weight=weights,
                 )
                 .to_polars()
                 .with_columns(pl.lit(t).alias("threshold"))
