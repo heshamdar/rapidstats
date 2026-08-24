@@ -1118,7 +1118,11 @@ class Bootstrap:
 
         elif strategy == "cum_sum":
             if thresholds is None:
-                thresholds = df["y_score"]
+                # `.unique()` matters: the raw column repeats whenever scores tie, and
+                # duplicated targets both waste work and break the 1:1 protected/control
+                # join below. `confusion_matrix_at_thresholds` and the non-bootstrap AIR
+                # already deduplicate; this one did not.
+                thresholds = df["y_score"].unique()
 
             if self._params["poisson"]:
                 _air_func = _air_at_thresholds_core_sorted

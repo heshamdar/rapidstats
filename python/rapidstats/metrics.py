@@ -513,6 +513,12 @@ def _air_at_thresholds_core_sorted(
         else pf.lazy().select("y_score").unique().collect().to_series()
     )
 
+    # The protected/control join below is 1:1, so targets must be distinct. Enforce it
+    # here rather than trusting every caller: a duplicated target is meaningless for AIR
+    # (it would emit the same ratio twice) and previously raised a bare polars
+    # ComputeError about join validation.
+    thresholds = pl.Series("threshold", thresholds).unique()
+
     p = p.pipe(_map_to_thresholds, thresholds).with_columns(
         pl.when(pl.col("_threshold_actual").is_null())
         .then(1)
@@ -868,33 +874,45 @@ def _map_to_thresholds(
     pf: PolarsFrame,
     thresholds: Optional[list[float]],
 ) -> pl.LazyFrame:
+    """Map each requested threshold onto the curve row that applies to it.
+
+    For target `t`, that is the row with the smallest curve threshold still `>= t`, or
+    nulls when no such row exists. Returns the targets as `threshold` and the matched
+    curve threshold as `_threshold_actual`, ascending.
+
+    This is an as-of join. It was previously a cross join plus filter plus per-target
+    `min`, which is O(n*m) and dominated every bootstrapped threshold metric -- the
+    statistics themselves are near-free by comparison. It also carried a
+    `validate="1:1"` that made duplicate targets a hard error.
+    """
     if thresholds is None:
         return pf.lazy()
 
     lf = pf.lazy()
-    target = pl.LazyFrame({"target_threshold": thresholds})
-
-    mapping = (
-        target.join(lf.select("threshold"), how="cross")
-        .filter(pl.col("threshold").ge(pl.col("target_threshold")))
-        .group_by("target_threshold")
-        .agg(pl.col("threshold").min())
+    targets = (
+        thresholds
+        if isinstance(thresholds, pl.Series)
+        else pl.Series("threshold", thresholds)
     )
 
-    mapping = target.join(
-        mapping,
-        on="target_threshold",
-        how="left",
-        validate="1:1",
-    )
+    # An integer score column paired with float thresholds (or the reverse) compared
+    # fine under the old value-wise join. `join_asof` requires one dtype on both sides,
+    # so reconcile before joining rather than raising at the user.
+    curve_dtype = lf.collect_schema()["threshold"]
+    if targets.dtype != curve_dtype:
+        targets = targets.cast(pl.Float64)
+        lf = lf.with_columns(pl.col("threshold").cast(pl.Float64))
 
-    res = (
-        mapping.join(lf, on="threshold", how="left", validate="m:m")
-        .rename({"threshold": "_threshold_actual"})
-        .rename({"target_threshold": "threshold"})
+    return (
+        pl.LazyFrame({"threshold": targets})
+        .sort("threshold")
+        .join_asof(
+            lf.rename({"threshold": "_threshold_actual"}).sort("_threshold_actual"),
+            left_on="threshold",
+            right_on="_threshold_actual",
+            strategy="forward",
+        )
     )
-
-    return res
 
 
 def confusion_matrix_at_thresholds(

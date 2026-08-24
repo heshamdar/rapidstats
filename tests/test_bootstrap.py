@@ -220,3 +220,45 @@ def test_bootstrap_succesfully_runs(method, sampling_method):
     bs.mean_squared_error(y_true_score, y_score)
     bs.root_mean_squared_error(y_true_score, y_score)
     bs.r2(y_true_score, y_score)
+
+
+@pytest.mark.parametrize("strategy", ["loop", "cum_sum"])
+def test_air_at_thresholds_with_tied_scores(strategy):
+    """Tied scores must not crash the bootstrap.
+
+    `Bootstrap.adverse_impact_ratio_at_thresholds` passed the raw `y_score` column as
+    the threshold list when `thresholds` was None, where the non-bootstrap version
+    deduplicates first. Duplicated targets then tripped a `validate="1:1"` join inside
+    `_map_to_thresholds`, so any score column with repeats -- rounded scores, integer
+    scores, credit-style bands -- raised `ComputeError: join keys did not fulfill 1:1
+    validation`.
+    """
+    rand = np.random.RandomState(0)
+    n = 200
+    # Rounding to 2dp guarantees ties: ~89 distinct values across 200 rows.
+    y_score = np.round(rand.rand(n), 2)
+    protected = rand.choice([True, False], n)
+
+    assert len(np.unique(y_score)) < n, "fixture must contain tied scores"
+
+    bs = rapidstats.Bootstrap(iterations=3, seed=208)
+    res = bs.adverse_impact_ratio_at_thresholds(
+        y_score, protected, ~protected, strategy=strategy
+    )
+
+    assert res.height == len(np.unique(y_score))
+    assert res["threshold"].n_unique() == res.height
+
+
+def test_cm_at_thresholds_with_duplicate_user_thresholds():
+    """A caller passing duplicate thresholds should not crash either."""
+    rand = np.random.RandomState(1)
+    n = 200
+    y_true = rand.choice([True, False], n)
+    y_score = rand.rand(n)
+
+    res = rapidstats.metrics.confusion_matrix_at_thresholds(
+        y_true, y_score, thresholds=[0.25, 0.5, 0.5, 0.75], strategy="cum_sum"
+    )
+
+    assert res.height > 0
