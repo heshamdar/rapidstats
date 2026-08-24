@@ -26,7 +26,7 @@ from tests.paths import DAT_PATH
 # These are deterministic computations, so the net is held to near-machine precision.
 # `polars.testing.assert_frame_equal` defaults to rtol=1e-5, which is loose enough to
 # hide a real refactor bug; it also renamed `rtol` -> `rel_tol` in 1.32.3, which would
-# force version-sniffing in a file that must run on both 1.32 and 1.43.
+# force version-sniffing in a file that must run across the whole supported range.
 RTOL = 1e-12
 ATOL = 1e-12
 
@@ -126,7 +126,11 @@ def _assert_frame_close(actual: pl.DataFrame, expected: pl.DataFrame, name: str)
             e_np = np.where(e.is_null().to_numpy(), np.nan, e_np)
 
             np.testing.assert_allclose(
-                a_np, e_np, rtol=RTOL, atol=ATOL, equal_nan=True,
+                a_np,
+                e_np,
+                rtol=RTOL,
+                atol=ATOL,
+                equal_nan=True,
                 err_msg=f"{name}: column {col!r} drifted",
             )
         else:
@@ -284,6 +288,37 @@ for _sampling in ["poisson", "multinomial"]:
     def _(sampling=_sampling):
         return _bootstrap("percentile", sampling).roc_auc(
             DATA["y_true"], DATA["y_score"]
+        )
+
+
+# `Bootstrap.roc_auc` is handled entirely in Rust, so the cases above never exercise the
+# Python resampling helpers. These do: `run` and the `cum_sum` paths route through
+# `_poisson_sample` / `_multinomial_sample`, which Tranche 2c replaces with a
+# weight-based equivalent.
+for _sampling in ["poisson", "multinomial"]:
+
+    @case(f"bootstrap_run_mean_{_sampling}")
+    def _(sampling=_sampling):
+        frame = pl.DataFrame({"y": DATA["y_score"]})
+
+        return _bootstrap("percentile", sampling).run(
+            frame, lambda df: float(df["y"].mean())
+        )
+
+    @case(f"bootstrap_cm_at_thresholds_percentile_{_sampling}")
+    def _(sampling=_sampling):
+        return _bootstrap("percentile", sampling).confusion_matrix_at_thresholds(
+            DATA["y_true"], DATA["y_score"], thresholds=THRESHOLDS, strategy="cum_sum"
+        )
+
+    @case(f"bootstrap_air_at_thresholds_percentile_{_sampling}")
+    def _(sampling=_sampling):
+        return _bootstrap("percentile", sampling).adverse_impact_ratio_at_thresholds(
+            DATA["y_score"],
+            DATA["protected"],
+            DATA["control"],
+            thresholds=THRESHOLDS,
+            strategy="cum_sum",
         )
 
 

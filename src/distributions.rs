@@ -94,3 +94,27 @@ pub fn poisson(lam: f64, size: usize, seed: Option<u64>) -> Vec<u64> {
 
     poi.sample_iter(rng).take(size).map(|x| x as u64).collect()
 }
+
+/// Expand Poisson(lam) draw counts into gather indices: row `i` appears `count[i]`
+/// times, in order.
+///
+/// Equivalent to `repeat_by` + `explode` on a row index, but without materialising the
+/// intermediate list column -- and, more importantly, without depending on `explode`'s
+/// `empty_as_null` default, which Polars 2.0 flips and whose pinning kwarg does not
+/// exist before polars 1.41.
+///
+/// Uses the same `poisson` draw as above, so for a given seed the counts -- and hence
+/// the resample -- are identical to the previous implementation.
+pub fn poisson_repeat_indices(lam: f64, size: usize, seed: Option<u64>) -> Vec<u32> {
+    let counts = poisson(lam, size, seed);
+    let total: u64 = counts.iter().sum();
+
+    let mut indices: Vec<u32> = Vec::with_capacity(total as usize);
+    for (i, &count) in counts.iter().enumerate() {
+        for _ in 0..count {
+            indices.push(i as u32);
+        }
+    }
+
+    indices
+}

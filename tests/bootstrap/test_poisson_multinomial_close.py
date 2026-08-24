@@ -48,7 +48,7 @@ def test_confusion_matrix():
         .sort("metric")
     )
 
-    polars.testing.assert_frame_equal(p_res, m_res, rtol=REL_TOL)
+    polars.testing.assert_frame_equal(p_res, m_res, rel_tol=REL_TOL)
 
 
 # def test_confusion_matrix_at_thresholds():
@@ -63,4 +63,4 @@ def test_confusion_matrix():
 #         "threshold", "metric"
 #     )
 
-#     polars.testing.assert_frame_equal(p_res, m_res, rtol=REL_TOL)
+#     polars.testing.assert_frame_equal(p_res, m_res, rel_tol=REL_TOL)

@@ -176,6 +176,12 @@ fn _poisson(lam: f64, size: usize, seed: Option<u64>) -> PyResult<Vec<u64>> {
 }
 
 #[pyfunction]
+#[pyo3(signature = (lam, size, seed = None))]
+fn _poisson_repeat_indices(lam: f64, size: usize, seed: Option<u64>) -> PyResult<Vec<u32>> {
+    Ok(distributions::poisson_repeat_indices(lam, size, seed))
+}
+
+#[pyfunction]
 fn _trapezoidal_auc(df: PyDataFrame) -> PyResult<f64> {
     let df: DataFrame = df.into();
 
@@ -247,6 +253,7 @@ fn _rustystats(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_norm_ppf, m)?)?;
     m.add_function(wrap_pyfunction!(_norm_cdf, m)?)?;
     m.add_function(wrap_pyfunction!(_poisson, m)?)?;
+    m.add_function(wrap_pyfunction!(_poisson_repeat_indices, m)?)?;
     m.add_function(wrap_pyfunction!(_rectangular_auc, m)?)?;
     m.add_function(wrap_pyfunction!(_trapezoidal_auc, m)?)?;
     m.add_function(wrap_pyfunction!(_thin_points_greedy, m)?)?;

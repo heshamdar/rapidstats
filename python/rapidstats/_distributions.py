@@ -1,6 +1,11 @@
 from typing import Optional
 
-from ._rustystats import _norm_cdf, _norm_ppf, _poisson
+from ._rustystats import (
+    _norm_cdf,
+    _norm_ppf,
+    _poisson,
+    _poisson_repeat_indices,
+)
 
 
 class norm:
@@ -59,6 +64,18 @@ class Random:
 
     def poisson(self, lam: float, size: int) -> list[int]:
         res = _poisson(lam=lam, size=size, seed=self.seed)
+
+        self._increment_seed()
+
+        return res
+
+    def poisson_repeat_indices(self, lam: float, size: int) -> list[int]:
+        """Poisson(`lam`) draw counts expanded into gather indices.
+
+        Row `i` appears `count[i]` times, in order -- the resample that
+        `Random.poisson` counts describe, without building the counts in Python.
+        """
+        res = _poisson_repeat_indices(lam=lam, size=size, seed=self.seed)
 
         self._increment_seed()
 

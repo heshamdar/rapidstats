@@ -4,12 +4,18 @@ import dataclasses
 import functools
 import math
 from collections.abc import Iterable
-from typing import Callable, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import polars as pl
-from polars.lazyframe.group_by import LazyGroupBy
-from polars.series.series import ArrayLike
 from tqdm.auto import tqdm
+
+from ._typing import ArrayLike
+
+if TYPE_CHECKING:
+    # Private path, and only ever used as an annotation. `from __future__ import
+    # annotations` above means it is never resolved at runtime, so keep it out of the
+    # import graph rather than depending on polars internals.
+    from polars.lazyframe.group_by import LazyGroupBy
 
 from ._distributions import Random, norm
 from ._rustystats import (
@@ -262,16 +268,20 @@ def _bca_interval_polars(
 def _poisson_sample(
     pf: PolarsFrame, df_height: int, seed: Optional[int]
 ) -> PolarsFrame:
-    repeats = pl.Series("repeats", Random(seed).poisson(1, size=df_height))
-
-    return (
-        pf.with_row_index("index")
-        .with_columns(repeats)
-        .with_columns(pl.col("index").repeat_by("repeats"))
-        .explode("index")
-        .drop_nulls("index")
-        .drop("index", "repeats")
+    # Previously this built a row index, `repeat_by`'d it and `explode`d. That relied on
+    # `explode`'s `empty_as_null` default (rows drawn zero times became nulls, which a
+    # following `drop_nulls` removed) -- a default Polars 2.0 flips, and whose pinning
+    # kwarg does not exist before polars 1.41. Expanding the counts to gather indices in
+    # Rust sidesteps the question entirely, works on every supported polars, and is
+    # roughly 2x faster. The underlying draw is unchanged, so a given seed produces the
+    # same resample as before.
+    indices = pl.Series(
+        "index",
+        Random(seed).poisson_repeat_indices(1, size=df_height),
+        dtype=pl.UInt32,
     )
+
+    return pf.select(pl.all().gather(indices))
 
 
 def _multinomial_sample(df: pl.DataFrame, seed: Optional[int]) -> pl.DataFrame:

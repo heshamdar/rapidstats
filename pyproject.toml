@@ -11,8 +11,11 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 dependencies = [
-    # 1.26.0 https://github.com/pola-rs/polars/issues/21913
-    "polars>=1.0.0,!=1.26.0",
+    # The compiled extension embeds a polars-rs ABI via pyo3-polars, so the range is
+    # bounded at both ends. The floor is 1.33 because `nulls_equal` (renamed from
+    # `join_nulls`) and `join_asof` semantics are relied on directly rather than
+    # version-sniffed.
+    "polars>=1.33,<2.0",
     "narwhals>=1.0.0",
     "tqdm",
 ]
@@ -99,7 +102,7 @@ garbage_collection = true
 [tool.isort]
 profile = "black"
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]
 
 
