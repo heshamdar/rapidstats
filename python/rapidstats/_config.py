@@ -9,14 +9,26 @@ Engine = Literal["in-memory", "streaming"]
 
 _VALID_ENGINES: tuple[Engine, ...] = ("in-memory", "streaming")
 
-# In-memory rather than streaming, on measurement rather than habit. This library's hot
-# paths are sorts, `cum_sum` scans and as-of joins -- order-dependent operations that
-# resist morsel parallelism -- and the bootstrap runs many small queries, where the
-# streaming engine's per-query setup dominates. Benchmarked on polars 1.44, streaming
-# measured 0.18-0.94x on these shapes while winning 3.5-4.4x on generic group_by and
-# filter scans. See `benchmarks/bench_engine.py`; revisit when polars flips its own
-# default, and prefer streaming for lazy `scan_*` sources where the data need never be
-# materialised at all.
+# In-memory rather than streaming, on measurement rather than habit -- but the right
+# choice depends on where the data comes from, so this is a default, not a verdict.
+#
+# From an in-memory frame, the library's hot paths are sorts, `cum_sum` scans and as-of
+# joins: order-dependent work that resists morsel parallelism. Benchmarked on polars 1.44,
+# streaming measured 0.18-0.94x on those shapes.
+#
+# From a `scan_parquet` source (see `data=` in `metrics.py`) the picture inverts, because
+# there is a real scan to stream and columns to prune:
+#
+#     confusion_matrix_at_thresholds, 2M rows, 2 of 42 columns
+#         in-memory 2638.5ms    streaming 487.9ms    5.4x
+#
+# So prefer streaming when reading from disk:
+#
+#     with rs.Config.engine("streaming"):
+#         rs.metrics.confusion_matrix_at_thresholds("y", "p", data=pl.scan_parquet(...))
+#
+# `benchmarks/bench_engine.py` reports the whole grid; revisit this default when polars
+# flips its own.
 _DEFAULT_ENGINE: Engine = "in-memory"
 
 _engine: Engine = _DEFAULT_ENGINE

@@ -152,6 +152,51 @@ def bench_generic_shapes():
         _row(label, per_engine)
 
 
+def bench_scan_source():
+    """The shape lazy inputs unlock: data arriving from disk, never fully materialised.
+
+    Every other shape in this file starts from an in-memory frame, where streaming can
+    only add per-morsel overhead. Here the source is a `scan_parquet` with many columns
+    the metric does not name, so projection pushdown prunes them and the engine has a
+    genuine scan to stream.
+    """
+    import tempfile
+
+    _header("Scan source (lazy inputs -- streaming's home ground for this library)")
+
+    rand = np.random.RandomState(SEED)
+    n, filler = 2_000_000, 40
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = f"{tmpdir}/wide.parquet"
+        y_score = rand.rand(n)
+        pl.DataFrame(
+            {
+                "y_true": rand.rand(n) < 0.3 + 0.4 * y_score,
+                "y_score": y_score,
+                **{f"filler_{i}": rand.rand(n) for i in range(filler)},
+            }
+        ).write_parquet(path)
+
+        cases = {
+            f"roc_auc from scan (2 of {filler + 2} cols)": lambda: rs.metrics.roc_auc(
+                "y_true", "y_score", data=pl.scan_parquet(path)
+            ),
+            f"cm_at_thresholds from scan (2 of {filler + 2} cols)": lambda: (
+                rs.metrics.confusion_matrix_at_thresholds(
+                    "y_true", "y_score", data=pl.scan_parquet(path), strategy="cum_sum"
+                )
+            ),
+        }
+
+        for label, call in cases.items():
+            per_engine = {}
+            for engine in ENGINES:
+                with rs.Config.engine(engine):
+                    per_engine[engine] = _bench(call, repeats=3)
+            _row(label, per_engine)
+
+
 def main():
     print(f"polars {pl.__version__} | rapidstats engine benchmark")
     print(f"medians of {REPEATS} runs; 'in/str' > 1 means streaming is faster")
@@ -159,6 +204,7 @@ def main():
     bench_library_shapes()
     bench_bootstrap()
     bench_generic_shapes()
+    bench_scan_source()
 
     print(
         "\nIf the library shapes stop favouring in-memory, revisit the default in "

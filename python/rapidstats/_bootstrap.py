@@ -663,6 +663,8 @@ class Bootstrap:
         y_pred: ArrayLike,
         beta: float = 1.0,
         sample_weight: Optional[ArrayLike] = None,
+        *,
+        data=None,
     ) -> BootstrappedConfusionMatrix:
         r"""Bootstrap confusion matrix. See [rapidstats.metrics.confusion_matrix][] for
         more details.
@@ -690,9 +692,9 @@ class Bootstrap:
         Added in version 0.1.0
         ----------------------
         """
-        df = _y_true_y_pred_to_df(y_true, y_pred, sample_weight).with_columns(
-            pl.col("y_true").cast(pl.UInt8)
-        )
+        df = _y_true_y_pred_to_df(
+            y_true, y_pred, sample_weight, data=data
+        ).with_columns(pl.col("y_true").cast(pl.UInt8))
 
         return BootstrappedConfusionMatrix(
             *_bootstrap_confusion_matrix(df, beta, **self._params)
@@ -707,6 +709,8 @@ class Bootstrap:
         strategy: LoopStrategy = "auto",
         beta: float = 1.0,
         sample_weight: Optional[ArrayLike] = None,
+        *,
+        data=None,
     ) -> pl.DataFrame:
         r"""Bootstrap confusion matrix at thresholds. See
         [rapidstats.metrics.confusion_matrix_at_thresholds][] for more details.
@@ -742,7 +746,7 @@ class Bootstrap:
         ----------------------
         """
         df = (
-            _y_true_y_score_to_df(y_true, y_score, sample_weight)
+            _y_true_y_score_to_df(y_true, y_score, sample_weight, data=data)
             .rename({"y_score": "threshold"})
             .sort("threshold", descending=True)
         )
@@ -893,6 +897,8 @@ class Bootstrap:
         y_true: ArrayLike,
         y_score: ArrayLike,
         sample_weight: Optional[ArrayLike] = None,
+        *,
+        data=None,
     ) -> ConfidenceInterval:
         """Bootstrap ROC-AUC. See [rapidstats.metrics.roc_auc][] for more details.
 
@@ -918,9 +924,9 @@ class Bootstrap:
         - Added in version 0.1.0
         - Returns point estimate instead of mean starting version 0.3.0
         """
-        df = _y_true_y_score_to_df(y_true, y_score, sample_weight).with_columns(
-            pl.col("y_true").cast(pl.Float64)
-        )
+        df = _y_true_y_score_to_df(
+            y_true, y_score, sample_weight, data=data
+        ).with_columns(pl.col("y_true").cast(pl.Float64))
 
         # ROC-AUC needs its input sorted by score. Any resampling that preserves row
         # order lets that sort happen once here rather than inside all `iterations`
@@ -1051,7 +1057,9 @@ class Bootstrap:
                 original_stat, bootstrap_stats, jacknife_stats, self.alpha
             )
 
-    def max_ks(self, y_true: ArrayLike, y_score: ArrayLike) -> ConfidenceInterval:
+    def max_ks(
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
+    ) -> ConfidenceInterval:
         """Bootstrap Max-KS. See [rapidstats.metrics.max_ks][] for more details.
 
         Parameters
@@ -1071,11 +1079,13 @@ class Bootstrap:
         - Added in version 0.1.0
         - Returns point estimate instead of mean starting version 0.3.0
         """
-        df = _y_true_y_score_to_df(y_true, y_score)
+        df = _y_true_y_score_to_df(y_true, y_score, data=data)
 
         return _bootstrap_max_ks(df, **self._params_unweighted)
 
-    def brier_loss(self, y_true: ArrayLike, y_score: ArrayLike) -> ConfidenceInterval:
+    def brier_loss(
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
+    ) -> ConfidenceInterval:
         """Bootstrap Brier loss. See [rapidstats.metrics.brier_loss][] for more details.
 
         Parameters
@@ -1090,7 +1100,7 @@ class Bootstrap:
         ConfidenceInterval
             A tuple of (lower, point, upper)
         """
-        df = _y_true_y_score_to_df(y_true, y_score)
+        df = _y_true_y_score_to_df(y_true, y_score, data=data)
 
         return _bootstrap_brier_loss(df, **self._params_unweighted)
 
@@ -1337,7 +1347,7 @@ class Bootstrap:
                 )
 
     def mean_squared_error(
-        self, y_true: ArrayLike, y_score: ArrayLike
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
     ) -> ConfidenceInterval:
         r"""Bootstrap MSE. See [rapidstats.metrics.mean_squared_error][] for more details.
 
@@ -1357,11 +1367,11 @@ class Bootstrap:
         ----------------------
         """
         return _bootstrap_mean_squared_error(
-            _regression_to_df(y_true, y_score), **self._params
+            _regression_to_df(y_true, y_score, data=data), **self._params
         )
 
     def root_mean_squared_error(
-        self, y_true: ArrayLike, y_score: ArrayLike
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
     ) -> ConfidenceInterval:
         r"""Bootstrap RMSE. See [rapidstats.metrics.root_mean_squared_error][] for more details.
 
@@ -1381,10 +1391,12 @@ class Bootstrap:
         ----------------------
         """
         return _bootstrap_root_mean_squared_error(
-            _regression_to_df(y_true, y_score), **self._params
+            _regression_to_df(y_true, y_score, data=data), **self._params
         )
 
-    def r2(self, y_true: ArrayLike, y_score: ArrayLike) -> ConfidenceInterval:
+    def r2(
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
+    ) -> ConfidenceInterval:
         """Bootstrap R2. See [rapidstats.metrics.r2][] for more details.
 
         Parameters
@@ -1402,4 +1414,6 @@ class Bootstrap:
         Added in version 0.1.0
         ----------------------
         """
-        return _bootstrap_r2(_regression_to_df(y_true, y_score), **self._params)
+        return _bootstrap_r2(
+            _regression_to_df(y_true, y_score, data=data), **self._params
+        )

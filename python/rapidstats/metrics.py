@@ -19,6 +19,9 @@ from ._rustystats import (
 from ._typing import ArrayLike, PolarsFrameT
 from ._utils import (
     _collect,
+    _column,
+    _resolve_data,
+    _y_true_y_score_to_lf,
     _fill_infinite,
     _regression_to_df,
     _run_concurrent,
@@ -173,11 +176,117 @@ class ConfusionMatrix:
         return pl.DataFrame({"metric": dct.keys(), "value": dct.values()})
 
 
+def _air_frame(y_pred, protected, control, sample_weight=None, *, data=None):
+    """Eager AIR input frame, from arrays or from named columns of `data`."""
+    if data is not None:
+        weight = (
+            pl.lit(1.0)
+            if sample_weight is None
+            else _column(sample_weight, "sample_weight").cast(pl.Float64)
+        )
+
+        return _collect(
+            _resolve_data(data).select(
+                _column(y_pred, "y_pred").alias("y_pred"),
+                _column(protected, "protected").alias("protected"),
+                _column(control, "control").alias("control"),
+                weight.alias("sample_weight"),
+            )
+        )
+
+    return pl.DataFrame(
+        {
+            "y_pred": y_pred,
+            "protected": protected,
+            "control": control,
+            "sample_weight": 1.0 if sample_weight is None else sample_weight,
+        }
+    )
+
+
+def _air_score_frame(y_score, protected, control, sample_weight=None, *, data=None):
+    """Lazy AIR-at-thresholds input, from arrays or from named columns of `data`."""
+    if data is not None:
+        weight = (
+            pl.lit(1.0)
+            if sample_weight is None
+            else _column(sample_weight, "sample_weight").cast(pl.Float64)
+        )
+
+        return _resolve_data(data).select(
+            _column(y_score, "y_score").cast(pl.Float64).alias("y_score"),
+            _column(protected, "protected").cast(pl.Boolean).alias("protected"),
+            _column(control, "control").cast(pl.Boolean).alias("control"),
+            weight.alias("sample_weight"),
+        )
+
+    return pl.LazyFrame(
+        {
+            "y_score": y_score,
+            "protected": protected,
+            "control": control,
+            "sample_weight": 1.0 if sample_weight is None else sample_weight,
+        }
+    ).select(
+        pl.col("y_score").cast(pl.Float64),
+        pl.col("protected", "control").cast(pl.Boolean),
+        pl.col("sample_weight").cast(pl.Float64),
+    )
+
+
+def _score_frame(y_score, sample_weight=None, *, data=None) -> pl.LazyFrame:
+    """Lazy `y_score`/`sample_weight` input, from arrays or named columns of `data`."""
+    if data is not None:
+        weight = (
+            pl.lit(1.0)
+            if sample_weight is None
+            else _column(sample_weight, "sample_weight").cast(pl.Float64)
+        )
+
+        return (
+            _resolve_data(data)
+            .select(
+                _column(y_score, "y_score").cast(pl.Float64).alias("y_score"),
+                weight.alias("sample_weight"),
+            )
+            .drop_nulls()
+        )
+
+    return pl.LazyFrame(
+        {
+            "y_score": y_score,
+            "sample_weight": 1.0 if sample_weight is None else sample_weight,
+        }
+    ).drop_nulls()
+
+
+def _cm_curve_frame(y_true, y_score, sample_weight=None, *, data=None) -> pl.LazyFrame:
+    """Lazy `y_true`/`threshold`/`sample_weight` input for the confusion-matrix curve."""
+    if data is not None:
+        return _y_true_y_score_to_lf(data, y_true, y_score, sample_weight).rename(
+            {"y_score": "threshold"}
+        )
+
+    return (
+        pl.LazyFrame(
+            {
+                "y_true": y_true,
+                "threshold": y_score,
+                "sample_weight": 1.0 if sample_weight is None else sample_weight,
+            }
+        )
+        .with_columns(pl.col("y_true").cast(pl.Boolean))
+        .drop_nulls()
+    )
+
+
 def confusion_matrix(
     y_true: ArrayLike,
     y_pred: ArrayLike,
     beta: float = 1.0,
     sample_weight: Optional[ArrayLike] = None,
+    *,
+    data=None,
 ) -> ConfusionMatrix:
     r"""Computes confusion matrix metrics (TP, FP, TN, FN, TPR, Fbeta, etc.).
 
@@ -203,7 +312,7 @@ def confusion_matrix(
     Added in version 0.1.0
     ----------------------
     """
-    df = _y_true_y_pred_to_df(y_true, y_pred, sample_weight).with_columns(
+    df = _y_true_y_pred_to_df(y_true, y_pred, sample_weight, data=data).with_columns(
         pl.col("y_true").cast(pl.UInt8)
     )
 
@@ -211,7 +320,11 @@ def confusion_matrix(
 
 
 def roc_auc(
-    y_true: ArrayLike, y_score: ArrayLike, sample_weight: Optional[ArrayLike] = None
+    y_true: ArrayLike,
+    y_score: ArrayLike,
+    sample_weight: Optional[ArrayLike] = None,
+    *,
+    data=None,
 ) -> float:
     """Computes Area Under the Receiver Operating Characteristic Curve.
 
@@ -235,14 +348,14 @@ def roc_auc(
     Added in version 0.1.0
     ----------------------
     """
-    df = _y_true_y_score_to_df(y_true, y_score, sample_weight).with_columns(
+    df = _y_true_y_score_to_df(y_true, y_score, sample_weight, data=data).with_columns(
         pl.col("y_true").cast(pl.Float64)
     )
 
     return _roc_auc(df)
 
 
-def max_ks(y_true: ArrayLike, y_score: ArrayLike) -> float:
+def max_ks(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
     """Performs the two-sample Kolmogorov-Smirnov test on the predicted scores of the
     ground truth positive and ground truth negative classes. The KS test measures the
     highest distance between two CDFs, so the Max-KS metric measures how well the model
@@ -271,12 +384,12 @@ def max_ks(y_true: ArrayLike, y_score: ArrayLike) -> float:
     Added in version 0.1.0
     ----------------------
     """
-    df = _y_true_y_score_to_df(y_true, y_score)
+    df = _y_true_y_score_to_df(y_true, y_score, data=data)
 
     return _max_ks(df)
 
 
-def brier_loss(y_true: ArrayLike, y_score: ArrayLike) -> float:
+def brier_loss(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
     r"""Computes the Brier loss (smaller is better). The Brier loss measures the mean
     squared difference between the predicted scores and the ground truth target.
     Calculated as:
@@ -300,12 +413,12 @@ def brier_loss(y_true: ArrayLike, y_score: ArrayLike) -> float:
     Added in version 0.1.0
     ----------------------
     """
-    df = _y_true_y_score_to_df(y_true, y_score)
+    df = _y_true_y_score_to_df(y_true, y_score, data=data)
 
     return _brier_loss(df)
 
 
-def mean(y: ArrayLike) -> float:
+def mean(y: ArrayLike, *, data=None) -> float:
     """Computes the mean of the input array.
 
     Parameters
@@ -321,7 +434,12 @@ def mean(y: ArrayLike) -> float:
     Added in version 0.1.0
     ----------------------
     """
-    return _mean(pl.DataFrame({"y": y}))
+    if data is not None:
+        frame = _collect(_resolve_data(data).select(_column(y, "y").alias("y")))
+    else:
+        frame = pl.DataFrame({"y": y})
+
+    return _mean(frame)
 
 
 def _weighted_mean(x: pl.Series, sample_weight: pl.Series):
@@ -333,6 +451,9 @@ def predicted_positive_ratio_at_thresholds(
     sample_weight: Optional[ArrayLike] = None,
     thresholds: Optional[list[float]] = None,
     strategy: LoopStrategy = "auto",
+    *,
+    data=None,
+    lazy: bool = False,
 ) -> pl.DataFrame:
     """Computes the Predicted Positive Ratio (PPR) at each threshold, where the PPR is
     the ratio of predicted positive to the total, and a positive is defined as
@@ -361,14 +482,12 @@ def predicted_positive_ratio_at_thresholds(
     Added in version 0.1.0
     ----------------------
     """
-    lf = pl.LazyFrame(
-        {
-            "y_score": y_score,
-            "sample_weight": 1.0 if sample_weight is None else sample_weight,
-        }
-    ).drop_nulls()
+    lf = _score_frame(y_score, sample_weight, data=data)
 
     strategy = _set_loop_strategy(thresholds, strategy)
+
+    if lazy and strategy == "loop":
+        raise ValueError("`lazy=True` requires `strategy='cum_sum'`")
 
     if strategy == "loop":
         df = lf.pipe(_collect)
@@ -402,7 +521,7 @@ def predicted_positive_ratio_at_thresholds(
                     .alias("ppr")
                 )
 
-        return (
+        result = (
             lf.sort("y_score", descending=True)
             .pipe(_cumulative_ppr, sample_weight is not None)
             .rename({"y_score": "threshold"})
@@ -410,8 +529,9 @@ def predicted_positive_ratio_at_thresholds(
             .pipe(_dedup_ties)
             .pipe(_map_to_thresholds, thresholds)
             .drop("_threshold_actual", strict=False)
-            .pipe(_collect)
         )
+
+        return result if lazy else _collect(result)
 
 
 def adverse_impact_ratio(
@@ -419,6 +539,8 @@ def adverse_impact_ratio(
     protected: ArrayLike,
     control: ArrayLike,
     sample_weight: Optional[ArrayLike] = None,
+    *,
+    data=None,
 ) -> float:
     """Computes the Adverse Impact Ratio (AIR), which is the ratio of negative
     predictions for the protected class and the control class. The ideal ratio is 1.
@@ -449,14 +571,7 @@ def adverse_impact_ratio(
     ----------------------
     """
     return _adverse_impact_ratio(
-        pl.DataFrame(
-            {
-                "y_pred": y_pred,
-                "protected": protected,
-                "control": control,
-                "sample_weight": 1.0 if sample_weight is None else sample_weight,
-            }
-        )
+        _air_frame(y_pred, protected, control, sample_weight, data=data)
         .with_columns(pl.col("y_pred", "protected", "control").cast(pl.Boolean))
         .with_columns(pl.col("y_pred").cast(pl.Float64))
     )
@@ -566,6 +681,9 @@ def adverse_impact_ratio_at_thresholds(
     sample_weight: Optional[ArrayLike] = None,
     thresholds: Optional[list[float]] = None,
     strategy: LoopStrategy = "auto",
+    *,
+    data=None,
+    lazy: bool = False,
 ) -> pl.DataFrame:
     """Computes the Adverse Impact Ratio (AIR) at each threshold of `y_score`. See
     [rapidstats.metrics.adverse_impact_ratio][] for more details. When the `strategy` is
@@ -606,21 +724,15 @@ def adverse_impact_ratio_at_thresholds(
     ----------------------
     """
     has_sample_weight = sample_weight is not None
-    df = pl.DataFrame(
-        {
-            "y_score": y_score,
-            "protected": protected,
-            "control": control,
-            "sample_weight": sample_weight if has_sample_weight else 1.0,
-        }
-    ).with_columns(
-        pl.col("protected", "control").cast(pl.Boolean),
-        pl.col("y_score", "sample_weight").cast(pl.Float64),
-    )
+    lf = _air_score_frame(y_score, protected, control, sample_weight, data=data)
 
     strategy = _set_loop_strategy(thresholds, strategy)
 
+    if lazy and strategy == "loop":
+        raise ValueError("`lazy=True` requires `strategy='cum_sum'`")
+
     if strategy == "loop":
+        df = _collect(lf)
 
         def _air(t):
             return {
@@ -640,13 +752,15 @@ def adverse_impact_ratio_at_thresholds(
         res = pl.LazyFrame(airs)
     elif strategy == "cum_sum":
         res = _air_at_thresholds_core(
-            df, thresholds, has_sample_weight=has_sample_weight
+            lf, thresholds, has_sample_weight=has_sample_weight
         )
 
-    return res.pipe(_fill_infinite, None).fill_nan(None).pipe(_collect)
+    res = res.pipe(_fill_infinite, None).fill_nan(None)
+
+    return res if lazy else _collect(res)
 
 
-def mean_squared_error(y_true: ArrayLike, y_score: ArrayLike) -> float:
+def mean_squared_error(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
     r"""Computes Mean Squared Error (MSE) as
 
     \[ \frac{1}{N} \sum_{i=1}^{N} (yt_i - ys_i)^2 \]
@@ -668,10 +782,12 @@ def mean_squared_error(y_true: ArrayLike, y_score: ArrayLike) -> float:
     Added in version 0.1.0
     ----------------------
     """
-    return _mean_squared_error(_regression_to_df(y_true, y_score))
+    return _mean_squared_error(_regression_to_df(y_true, y_score, data=data))
 
 
-def root_mean_squared_error(y_true: ArrayLike, y_score: ArrayLike) -> float:
+def root_mean_squared_error(
+    y_true: ArrayLike, y_score: ArrayLike, *, data=None
+) -> float:
     r"""Computes Root Mean Squared Error (RMSE) as
 
     \[ \sqrt{\frac{1}{N} \sum_{i=1}^{N} (yt_i - ys_i)^2} \]
@@ -693,7 +809,7 @@ def root_mean_squared_error(y_true: ArrayLike, y_score: ArrayLike) -> float:
     Added in version 0.1.0
     ----------------------
     """
-    return _root_mean_squared_error(_regression_to_df(y_true, y_score))
+    return _root_mean_squared_error(_regression_to_df(y_true, y_score, data=data))
 
 
 def _dedup_ties(
@@ -924,6 +1040,9 @@ def confusion_matrix_at_thresholds(
     strategy: LoopStrategy = "auto",
     beta: float = 1.0,
     sample_weight: Optional[ArrayLike] = None,
+    *,
+    data=None,
+    lazy: bool = False,
 ) -> pl.DataFrame:
     r"""Computes the confusion matrix at each threshold. When the `strategy` is
     "cum_sum", computes
@@ -967,6 +1086,12 @@ def confusion_matrix_at_thresholds(
     """
     strategy = _set_loop_strategy(thresholds, strategy)
 
+    if lazy and strategy == "loop":
+        raise ValueError(
+            "`lazy=True` requires `strategy='cum_sum'`; the loop strategy computes each "
+            "threshold through the Rust kernel, which needs materialised data"
+        )
+
     if strategy == "loop":
         # Nulls must be dropped jointly across all three inputs. This built the frame
         # from `y_true`/`y_score` alone and then passed the *original* full-length
@@ -974,7 +1099,7 @@ def confusion_matrix_at_thresholds(
         # column 'sample_weight' (5) does not match height of column 'y_true' (4)` --
         # and, had the lengths happened to match, would have shifted every weight after
         # the null onto the wrong row.
-        df = _y_true_y_score_to_df(y_true, y_score, sample_weight)
+        df = _y_true_y_score_to_df(y_true, y_score, sample_weight, data=data)
         weights = df["sample_weight"]
 
         def _cm(t):
@@ -993,16 +1118,8 @@ def confusion_matrix_at_thresholds(
 
         return pl.concat(cms, how="vertical").fill_nan(None)
     elif strategy == "cum_sum":
-        return (
-            pl.LazyFrame(
-                {
-                    "y_true": y_true,
-                    "threshold": y_score,
-                    "sample_weight": 1.0 if sample_weight is None else sample_weight,
-                }
-            )
-            .with_columns(pl.col("y_true").cast(pl.Boolean))
-            .drop_nulls()
+        result = (
+            _cm_curve_frame(y_true, y_score, sample_weight, data=data)
             .pipe(_base_confusion_matrix_at_thresholds)
             .pipe(_full_confusion_matrix_from_base, beta=beta)
             .select("threshold", *metrics)
@@ -1011,8 +1128,9 @@ def confusion_matrix_at_thresholds(
             .drop("_threshold_actual", strict=False)
             .unpivot(index="threshold")
             .rename({"variable": "metric"})
-            .pipe(_collect)
         )
+
+        return result if lazy else _collect(result)
 
 
 def _ap_from_pr_curve(precision: pl.Expr, recall: pl.Expr) -> pl.Expr:
@@ -1026,7 +1144,11 @@ def _ap_from_pr_curve(precision: pl.Expr, recall: pl.Expr) -> pl.Expr:
 
 
 def average_precision(
-    y_true: ArrayLike, y_score: ArrayLike, sample_weight: Optional[ArrayLike] = None
+    y_true: ArrayLike,
+    y_score: ArrayLike,
+    sample_weight: Optional[ArrayLike] = None,
+    *,
+    data=None,
 ) -> float:
     """Computes Average Precision.
 
@@ -1051,9 +1173,7 @@ def average_precision(
     ----------------------
     """
     return (
-        _y_true_y_score_to_df(y_true, y_score, sample_weight)
-        .lazy()
-        .rename({"y_score": "threshold"})
+        _cm_curve_frame(y_true, y_score, sample_weight, data=data)
         .pipe(_base_confusion_matrix_at_thresholds)
         .pipe(_full_confusion_matrix_from_base)
         .select("threshold", "precision", "tpr")
@@ -1071,11 +1191,17 @@ def capture_rate_at_quantiles(
     quantiles: int = 10,
     drop_intermediate: bool = True,
     raw_quantiles: bool = False,
+    *,
+    data=None,
+    lazy: bool = False,
 ) -> pl.DataFrame:
+    source = (
+        _y_true_y_score_to_lf(data, y_true, y_score)
+        if data is not None
+        else _y_true_y_score_to_df(y_true=y_true, y_score=y_score).lazy()
+    )
     lf = (
-        _y_true_y_score_to_df(y_true=y_true, y_score=y_score)
-        .lazy()
-        .with_columns(
+        source.with_columns(
             pl.col("y_score").qcut(quantiles, allow_duplicates=True).alias("quantile")
         )
         .group_by("quantile")
@@ -1092,10 +1218,10 @@ def capture_rate_at_quantiles(
     if not raw_quantiles:
         lf = lf.sort("quantile").drop("quantile").with_row_index("quantile", offset=1)
 
-    return lf.pipe(_collect)
+    return lf if lazy else _collect(lf)
 
 
-def r2(y_true: ArrayLike, y_score: ArrayLike) -> float:
+def r2(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
     r"""Computes R2 as
 
     \[
@@ -1117,4 +1243,4 @@ def r2(y_true: ArrayLike, y_score: ArrayLike) -> float:
     Added in version 0.1.0
     ----------------------
     """
-    return _r2(_regression_to_df(y_true, y_score))
+    return _r2(_regression_to_df(y_true, y_score, data=data))
