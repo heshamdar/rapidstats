@@ -85,6 +85,10 @@ allow_redefinition = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "perf: performance guard; deselected unless --runperf is passed",
+    "slow: long-running test; deselected unless --runslow is passed",
+]
 
 [tool.pybench]
 repeat = 50
