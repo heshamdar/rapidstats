@@ -18,6 +18,7 @@ from ._rustystats import (
 )
 from ._typing import ArrayLike, PolarsFrameT
 from ._utils import (
+    _collect,
     _fill_infinite,
     _regression_to_df,
     _run_concurrent,
@@ -370,7 +371,7 @@ def predicted_positive_ratio_at_thresholds(
     strategy = _set_loop_strategy(y_score, strategy)
 
     if strategy == "loop":
-        df = lf.collect()
+        df = lf.pipe(_collect)
 
         def _ppr(t: float) -> dict:
             return {
@@ -409,7 +410,7 @@ def predicted_positive_ratio_at_thresholds(
             .pipe(_dedup_ties)
             .pipe(_map_to_thresholds, thresholds)
             .drop("_threshold_actual", strict=False)
-            .collect()
+            .pipe(_collect)
         )
 
 
@@ -510,7 +511,7 @@ def _air_at_thresholds_core_sorted(
     thresholds = (
         thresholds
         if thresholds is not None
-        else pf.lazy().select("y_score").unique().collect().to_series()
+        else pf.lazy().select("y_score").unique().pipe(_collect).to_series()
     )
 
     # The protected/control join below is 1:1, so targets must be distinct. Enforce it
@@ -642,7 +643,7 @@ def adverse_impact_ratio_at_thresholds(
             df, thresholds, has_sample_weight=has_sample_weight
         )
 
-    return res.pipe(_fill_infinite, None).fill_nan(None).collect()
+    return res.pipe(_fill_infinite, None).fill_nan(None).pipe(_collect)
 
 
 def mean_squared_error(y_true: ArrayLike, y_score: ArrayLike) -> float:
@@ -1003,7 +1004,7 @@ def confusion_matrix_at_thresholds(
             .drop("_threshold_actual", strict=False)
             .unpivot(index="threshold")
             .rename({"variable": "metric"})
-            .collect()
+            .pipe(_collect)
         )
 
 
@@ -1052,7 +1053,7 @@ def average_precision(
         .drop_nulls()
         .sort("threshold")
         .select(_ap_from_pr_curve(pl.col("precision"), pl.col("tpr")).alias("ap"))
-        .collect()["ap"]
+        .pipe(_collect)["ap"]
         .item()
     )
 
@@ -1084,7 +1085,7 @@ def capture_rate_at_quantiles(
     if not raw_quantiles:
         lf = lf.sort("quantile").drop("quantile").with_row_index("quantile", offset=1)
 
-    return lf.collect()
+    return lf.pipe(_collect)
 
 
 def r2(y_true: ArrayLike, y_score: ArrayLike) -> float:

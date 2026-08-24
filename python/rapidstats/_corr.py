@@ -11,6 +11,8 @@ import narwhals.stable.v1.typing as nwt
 import polars as pl
 from tqdm.auto import tqdm
 
+from ._utils import _collect
+
 CorrelationMethod = Literal["pearson", "spearman"]
 CorrelationMatrixFormat = Literal["wide", "long"]
 
@@ -118,7 +120,7 @@ def _correlation_matrix(
         .drop("variable")
         .rename({"value": "correlation"})
         .select("c1", "c2", "correlation")
-        .collect()
+        .pipe(_collect)
     )
 
     if format == "wide":
@@ -219,7 +221,7 @@ def _batched_correlation_matrix(
         corr_mat = pl.scan_parquet(f)
         corr_mats.append(corr_mat)
 
-    corr_mat = pl.concat(corr_mats, how="vertical_relaxed").collect()
+    corr_mat = pl.concat(corr_mats, how="vertical_relaxed").pipe(_collect)
 
     if format == "wide":
         corr_mat = corr_mat.pivot(on="c1", index="c2", values="correlation").rename(

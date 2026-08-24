@@ -6,6 +6,7 @@ from typing import Literal
 import polars as pl
 
 from ._typing import ArrayLike
+from ._utils import _collect
 from .bin import auto, doane, freedman_diaconis, rice, scott, sqrt, sturges
 
 BinMethod = Literal["auto", "doane", "fd", "rice", "sturges", "scott", "sqrt"]
@@ -87,7 +88,7 @@ def _psi(
         .mul(pl.col("current_pct").truediv(pl.col("reference_pct")).log())
         .sum()
         .alias("res")
-    ).collect()
+    ).pipe(_collect)
 
     return res["res"].item()
 

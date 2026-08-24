@@ -16,6 +16,7 @@ import polars as pl
 from tqdm.auto import tqdm
 
 from ._corr import correlation_matrix
+from ._utils import _collect
 from ._typing import ArrayLike
 from .metrics import roc_auc
 
@@ -366,7 +367,7 @@ class RFE:
                     .sort(pl.col("importance").abs(), descending=True)
                     .select("feature")
                     .head(k)
-                    .collect()
+                    .pipe(_collect)
                     .get_column("feature")
                     .to_list()
                 )
@@ -559,7 +560,7 @@ class NFE:
                     pl.col("importance").filter(pl.col("feature").eq(self._NOISE_COL))
                 )
             )
-            .collect()["feature"]
+            .pipe(_collect)["feature"]
             .sort()
             .to_list()
         )
@@ -725,7 +726,7 @@ class CFE:
                 how="vertical",
             )
             .unique()
-            .collect()["x"]
+            .pipe(_collect)["x"]
             .to_list()
         )
 
@@ -737,7 +738,7 @@ class CFE:
                 nw.col("correlation").is_nan().__invert__(),
                 nw.col("correlation").__ge__(self.threshold),
             )
-            .collect()
+            .pipe(_collect)
         )
 
         drop_list = []

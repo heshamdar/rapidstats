@@ -109,3 +109,14 @@ def _run_concurrent(
             res.append(future.result())
 
     return res
+
+
+def _collect(lf: pl.LazyFrame, **kwargs):
+    """Collect through the configured engine.
+
+    Every `.collect()` in the library goes through here so the engine is one decision in
+    one place rather than 24 implicit ones. See `rapidstats.Config.set_engine`.
+    """
+    from ._config import Config
+
+    return lf.collect(engine=Config.get_engine(), **kwargs)

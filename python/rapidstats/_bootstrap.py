@@ -35,6 +35,7 @@ from ._rustystats import (
     _standard_interval,
 )
 from ._utils import (
+    _collect,
     _expr_fill_infinite,
     _fill_infinite,
     _regression_to_df,
@@ -139,12 +140,13 @@ def _js_func(i: int, df: pl.DataFrame, index: pl.Series, stat_func):
     return stat_func(df.filter(index.ne(i)))
 
 
-def _jacknife(df: pl.DataFrame, stat_func) -> list:
+def _jacknife(df: pl.DataFrame, stat_func, **executor_kwargs) -> list:
     df_height = df.height
     index = pl.Series("index", [i for i in range(df_height)])
     func = functools.partial(_js_func, df=df, index=index, stat_func=stat_func)
+    executor_kwargs.setdefault("quiet", True)
 
-    return _run_concurrent(func, range(df_height), quiet=True)
+    return _run_concurrent(func, range(df_height), **executor_kwargs)
 
 
 def _standard_interval_polars(lf: LazyGroupBy, alpha: float) -> pl.LazyFrame:
@@ -444,6 +446,14 @@ class Bootstrap:
         The chunksize for each thread. None means let the executor decide, by default
         None
 
+        Applies to the Rust kernels, which chunk their rayon iterator. The Python-side
+        paths submit tasks individually and ignore it.
+    quiet: bool, optional
+        Suppress progress bars, by default False
+
+        !!! Version
+            Added 0.5.0
+
     Raises
     ------
     ValueError
@@ -470,6 +480,7 @@ class Bootstrap:
         seed: Optional[int] = None,
         n_jobs: Optional[int] = None,
         chunksize: Optional[int] = None,
+        quiet: bool = False,
     ) -> None:
         if method not in ("standard", "percentile", "basic", "BCa"):
             raise ValueError(
@@ -495,6 +506,7 @@ class Bootstrap:
         self.resample_mode = resample_mode
         self.n_jobs = n_jobs
         self.chunksize = chunksize
+        self.quiet = quiet
 
         self._params = {
             "iterations": self.iterations,
@@ -506,6 +518,25 @@ class Bootstrap:
             "poisson": self.sampling_method == "poisson",
             "weights": self.resample_mode == "weights",
         }
+
+    @property
+    def _concurrent_kwargs(self) -> dict:
+        """Executor settings for the Python-side paths.
+
+        `n_jobs` and `quiet` were previously stored, forwarded to the Rust kernels, and
+        then dropped on the floor here: `_run_concurrent` only serialises when it sees
+        `max_workers == 1`, so `n_jobs=1` left the Python paths running on a thread pool.
+
+        `chunksize` is deliberately absent. It is meaningful to the Rust bootstrap, which
+        chunks its rayon iterator, but `ThreadPoolExecutor` takes no such argument and
+        these paths submit tasks individually.
+        """
+        kwargs: dict = {"quiet": self.quiet}
+
+        if self.n_jobs is not None:
+            kwargs["max_workers"] = self.n_jobs
+
+        return kwargs
 
     @property
     def _params_unweighted(self) -> dict:
@@ -549,6 +580,7 @@ class Bootstrap:
         ----------------------
         """
         default = {"executor": "threads", "preserve_order": False}
+        default.update(self._concurrent_kwargs)
         for k, v in default.items():
             if k not in kwargs:
                 kwargs[k] = v
@@ -581,7 +613,11 @@ class Bootstrap:
         elif self.method == "basic":
             return _basic_interval(original_stat, bootstrap_stats, self.alpha)
         elif self.method == "BCa":
-            jacknife_stats = [x for x in _jacknife(df, stat_func) if not math.isnan(x)]
+            jacknife_stats = [
+                x
+                for x in _jacknife(df, stat_func, **self._concurrent_kwargs)
+                if not math.isnan(x)
+            ]
 
             return _bca_interval(
                 original_stat, bootstrap_stats, jacknife_stats, self.alpha
@@ -740,6 +776,7 @@ class Bootstrap:
                     if self.seed is not None
                     else (None for _ in range(self.iterations))
                 ),
+                **self._concurrent_kwargs,
             )
 
             def _process_results(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -771,7 +808,7 @@ class Bootstrap:
                         validate="1:1",
                     )
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "percentile":
                 return (
@@ -783,7 +820,7 @@ class Bootstrap:
                         validate="1:1",
                     )
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "basic":
                 return (
@@ -796,7 +833,7 @@ class Bootstrap:
                     )
                     .pipe(_basic_interval_polars)
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "BCa":
                 raise NotImplementedError(
@@ -822,7 +859,7 @@ class Bootstrap:
                         by=["threshold", "metric"],
                     )
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             else:
                 raise ValueError()
@@ -934,6 +971,7 @@ class Bootstrap:
                 if self.seed is not None
                 else (None for _ in range(self.iterations))
             ),
+            **self._concurrent_kwargs,
         )
 
         cms = [
@@ -949,7 +987,7 @@ class Bootstrap:
                     "average_precision"
                 )
             )
-            .collect()["average_precision"]
+            .pipe(_collect)["average_precision"]
             .to_list()
         )
 
@@ -969,7 +1007,9 @@ class Bootstrap:
                 return _cm_inner(j_df).with_columns(pl.lit(i).alias("iteration"))
 
             df = df.with_row_index("index")
-            cms = _run_concurrent(_cm_jacknife, range(df.height))
+            cms = _run_concurrent(
+                _cm_jacknife, range(df.height), **self._concurrent_kwargs
+            )
             jacknife_stats = (
                 pl.concat(cms, how="vertical")
                 .sort("threshold")
@@ -979,7 +1019,7 @@ class Bootstrap:
                         "average_precision"
                     )
                 )
-                .collect()["average_precision"]
+                .pipe(_collect)["average_precision"]
                 .to_list()
             )
 
@@ -1196,6 +1236,7 @@ class Bootstrap:
                     if self.seed is not None
                     else (None for _ in range(self.iterations))
                 ),
+                **self._concurrent_kwargs,
             )
             bootstrap_lf = (
                 pl.concat(airs, how="vertical")
@@ -1220,14 +1261,14 @@ class Bootstrap:
                     _standard_interval_polars(lf, self.alpha)
                     .join(original, on="threshold", how="left", validate="1:1")
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "percentile":
                 return (
                     _percentile_interval_polars(lf, self.alpha)
                     .join(original, on="threshold", how="left", validate="1:1")
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "basic":
                 return (
@@ -1235,7 +1276,7 @@ class Bootstrap:
                     .join(original, on="threshold", how="left", validate="1:1")
                     .pipe(_basic_interval_polars)
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "BCa":
                 raise NotImplementedError(
@@ -1267,7 +1308,7 @@ class Bootstrap:
                         by=["threshold"],
                     )
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
 
     def mean_squared_error(
