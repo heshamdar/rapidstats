@@ -21,14 +21,17 @@ static ALLOC: PolarsAllocator = PolarsAllocator::new();
 macro_rules! generate_functions {
     ($func_name:ident, $metric_func:path) => {
         #[pyfunction]
-        fn $func_name(df: PyDataFrame) -> PyResult<f64> {
-            Ok($metric_func(df.into()))
+        fn $func_name(py: Python<'_>, df: PyDataFrame) -> PyResult<f64> {
+            let df: DataFrame = df.into();
+
+            Ok(py.allow_threads(move || $metric_func(df)))
         }
 
         paste! {
             #[pyfunction]
             #[pyo3(signature = (df, iterations, alpha, method, seed = None, n_jobs = None, chunksize = None, poisson = true))]
             fn [<_bootstrap $func_name>] (
+                py: Python<'_>,
                 df: PyDataFrame,
                 iterations: u64,
                 alpha: f64,
@@ -39,46 +42,60 @@ macro_rules! generate_functions {
                 poisson: bool,
             ) -> PyResult<bootstrap::ConfidenceInterval> {
                 let df: DataFrame = df.into();
-                let original_stat = $metric_func(df.clone());
-                let bootstrap_stats =
-                    bootstrap::run_bootstrap(df.clone(), iterations, seed, $metric_func, n_jobs, chunksize, poisson);
-                if method == "standard" {
-                    Ok(bootstrap::standard_interval(original_stat, bootstrap_stats, alpha))
-                }
-                else if method == "percentile" {
-                    Ok(bootstrap::percentile_interval(original_stat, bootstrap_stats, alpha))
-                } else if method == "basic" {
-                    Ok(bootstrap::basic_interval(original_stat, bootstrap_stats, alpha))
-                } else if method == "BCa" {
-                    let jacknife_stats = bootstrap::run_jacknife(df, $metric_func);
-                    Ok(bootstrap::bca_interval(
-                        original_stat,
-                        bootstrap_stats,
-                        jacknife_stats,
-                        alpha,
-                    ))
-                } else {
-                    Err(PyValueError::new_err(format!(
-                        "Invalid confidence interval method `{}`, only `percentile`, `basic`, and `BCa` are supported",
-                        method
-                    )))
-                }
+                // `method` borrows Python-owned memory, which cannot cross into
+                // `allow_threads`. Own it first.
+                let method = method.to_owned();
+
+                py.allow_threads(move || {
+                    let original_stat = $metric_func(df.clone());
+                    let bootstrap_stats =
+                        bootstrap::run_bootstrap(df.clone(), iterations, seed, $metric_func, n_jobs, chunksize, poisson);
+                    if method == "standard" {
+                        Ok(bootstrap::standard_interval(original_stat, bootstrap_stats, alpha))
+                    }
+                    else if method == "percentile" {
+                        Ok(bootstrap::percentile_interval(original_stat, bootstrap_stats, alpha))
+                    } else if method == "basic" {
+                        Ok(bootstrap::basic_interval(original_stat, bootstrap_stats, alpha))
+                    } else if method == "BCa" {
+                        let jacknife_stats = bootstrap::run_jacknife(df, $metric_func);
+                        Ok(bootstrap::bca_interval(
+                            original_stat,
+                            bootstrap_stats,
+                            jacknife_stats,
+                            alpha,
+                        ))
+                    } else {
+                        Err(PyValueError::new_err(format!(
+                            "Invalid confidence interval method `{}`, only `percentile`, `basic`, and `BCa` are supported",
+                            method
+                        )))
+                    }
+                })
             }
         }
     };
 }
 
 #[pyfunction]
-fn _confusion_matrix(df: PyDataFrame, beta: f64) -> PyResult<metrics::ConfusionMatrixArray> {
+fn _confusion_matrix(
+    py: Python<'_>,
+    df: PyDataFrame,
+    beta: f64,
+) -> PyResult<metrics::ConfusionMatrixArray> {
     let df: DataFrame = df.into();
-    let base_cm = metrics::base_confusion_matrix(df);
 
-    Ok(metrics::confusion_matrix(base_cm, beta))
+    Ok(py.allow_threads(move || {
+        let base_cm = metrics::base_confusion_matrix(df);
+
+        metrics::confusion_matrix(base_cm, beta)
+    }))
 }
 
 #[pyfunction]
 #[pyo3(signature = (df, beta, iterations, alpha, method, seed = None, n_jobs = None, chunksize = None, poisson = true))]
 fn _bootstrap_confusion_matrix(
+    py: Python<'_>,
     df: PyDataFrame,
     beta: f64,
     iterations: u64,
@@ -90,10 +107,13 @@ fn _bootstrap_confusion_matrix(
     poisson: bool,
 ) -> PyResult<Vec<bootstrap::ConfidenceInterval>> {
     let df: DataFrame = df.into();
+    let method = method.to_owned();
 
-    Ok(metrics::bootstrap_confusion_matrix(
-        df, beta, iterations, alpha, method, seed, n_jobs, chunksize, poisson,
-    ))
+    Ok(py.allow_threads(move || {
+        metrics::bootstrap_confusion_matrix(
+            df, beta, iterations, alpha, &method, seed, n_jobs, chunksize, poisson,
+        )
+    }))
 }
 
 generate_functions!(_roc_auc, metrics::roc_auc);
@@ -108,56 +128,51 @@ generate_functions!(_r2, metrics::r2);
 
 #[pyfunction]
 fn _standard_interval(
+    py: Python<'_>,
     original_stat: f64,
     bootstrap_stats: Vec<f64>,
     alpha: f64,
 ) -> PyResult<ConfidenceInterval> {
-    Ok(bootstrap::standard_interval(
-        original_stat,
-        bootstrap_stats,
-        alpha,
-    ))
+    Ok(py.allow_threads(move || {
+        bootstrap::standard_interval(original_stat, bootstrap_stats, alpha)
+    }))
 }
 
 #[pyfunction]
 fn _percentile_interval(
+    py: Python<'_>,
     original_stat: f64,
     bootstrap_stats: Vec<f64>,
     alpha: f64,
 ) -> PyResult<ConfidenceInterval> {
-    Ok(bootstrap::percentile_interval(
-        original_stat,
-        bootstrap_stats,
-        alpha,
-    ))
+    Ok(py.allow_threads(move || {
+        bootstrap::percentile_interval(original_stat, bootstrap_stats, alpha)
+    }))
 }
 
 #[pyfunction]
 fn _basic_interval(
+    py: Python<'_>,
     original_stat: f64,
     bootstrap_stats: Vec<f64>,
     alpha: f64,
 ) -> PyResult<ConfidenceInterval> {
-    Ok(bootstrap::basic_interval(
-        original_stat,
-        bootstrap_stats,
-        alpha,
-    ))
+    Ok(py.allow_threads(move || {
+        bootstrap::basic_interval(original_stat, bootstrap_stats, alpha)
+    }))
 }
 
 #[pyfunction]
 fn _bca_interval(
+    py: Python<'_>,
     original_stat: f64,
     bootstrap_stats: Vec<f64>,
     jacknife_stats: Vec<f64>,
     alpha: f64,
 ) -> PyResult<ConfidenceInterval> {
-    Ok(bootstrap::bca_interval(
-        original_stat,
-        bootstrap_stats,
-        jacknife_stats,
-        alpha,
-    ))
+    Ok(py.allow_threads(move || {
+        bootstrap::bca_interval(original_stat, bootstrap_stats, jacknife_stats, alpha)
+    }))
 }
 
 #[pyfunction]
@@ -171,39 +186,49 @@ fn _norm_cdf(x: f64) -> PyResult<f64> {
 }
 
 #[pyfunction]
-fn _poisson(lam: f64, size: usize, seed: Option<u64>) -> PyResult<Vec<u64>> {
-    Ok(distributions::poisson(lam, size, seed))
+fn _poisson(py: Python<'_>, lam: f64, size: usize, seed: Option<u64>) -> PyResult<Vec<u64>> {
+    Ok(py.allow_threads(move || distributions::poisson(lam, size, seed)))
 }
 
 #[pyfunction]
 #[pyo3(signature = (lam, size, seed = None))]
-fn _poisson_repeat_indices(lam: f64, size: usize, seed: Option<u64>) -> PyResult<Vec<u32>> {
-    Ok(distributions::poisson_repeat_indices(lam, size, seed))
+fn _poisson_repeat_indices(
+    py: Python<'_>,
+    lam: f64,
+    size: usize,
+    seed: Option<u64>,
+) -> PyResult<Vec<u32>> {
+    Ok(py.allow_threads(move || distributions::poisson_repeat_indices(lam, size, seed)))
 }
 
 #[pyfunction]
-fn _trapezoidal_auc(df: PyDataFrame) -> PyResult<f64> {
+fn _trapezoidal_auc(py: Python<'_>, df: PyDataFrame) -> PyResult<f64> {
     let df: DataFrame = df.into();
 
-    Ok(general::trapezoidal_auc(
-        df["x"].f64().unwrap().cont_slice().unwrap(),
-        df["y"].f64().unwrap().cont_slice().unwrap(),
-    ))
+    Ok(py.allow_threads(move || {
+        general::trapezoidal_auc(
+            df["x"].f64().unwrap().cont_slice().unwrap(),
+            df["y"].f64().unwrap().cont_slice().unwrap(),
+        )
+    }))
 }
 
 #[pyfunction]
-fn _rectangular_auc(df: PyDataFrame) -> PyResult<f64> {
+fn _rectangular_auc(py: Python<'_>, df: PyDataFrame) -> PyResult<f64> {
     let df: DataFrame = df.into();
 
-    Ok(general::rectangular_auc(
-        df["x"].f64().unwrap().cont_slice().unwrap(),
-        df["y"].f64().unwrap().cont_slice().unwrap(),
-    ))
+    Ok(py.allow_threads(move || {
+        general::rectangular_auc(
+            df["x"].f64().unwrap().cont_slice().unwrap(),
+            df["y"].f64().unwrap().cont_slice().unwrap(),
+        )
+    }))
 }
 
 #[pyfunction]
 #[pyo3(signature = (df, x, y, min_distance, always_keep, order))]
 fn _thin_points_greedy(
+    py: Python<'_>,
     df: PyDataFrame,
     x: &str,
     y: &str,
@@ -212,15 +237,20 @@ fn _thin_points_greedy(
     order: Option<&str>,
 ) -> PyResult<Vec<bool>> {
     let df: DataFrame = df.into();
+    // Column names borrow Python-owned memory; own them before releasing the GIL.
+    let (x, y, always_keep) = (x.to_owned(), y.to_owned(), always_keep.to_owned());
+    let order = order.map(|o| o.to_owned());
 
-    Ok(viz::thin_points_greedy(
-        df,
-        x,
-        y,
-        min_distance,
-        always_keep,
-        order,
-    ))
+    Ok(py.allow_threads(move || {
+        viz::thin_points_greedy(
+            df,
+            &x,
+            &y,
+            min_distance,
+            &always_keep,
+            order.as_deref(),
+        )
+    }))
 }
 
 /// A Python module implemented in Rust.
