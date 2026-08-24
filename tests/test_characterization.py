@@ -322,9 +322,9 @@ for _sampling in ["poisson", "multinomial"]:
         )
 
 
-# `cum_sum` bootstraps currently raise NotImplementedError for BCa, so only the three
-# supported methods are pinned here. Tranche 3 re-enables BCa and adds its fixture.
-for _method in ["standard", "percentile", "basic"]:
+# All four methods, including BCa: the `cum_sum` paths used to raise
+# NotImplementedError for it, on an upstream polars bug that is now fixed.
+for _method in METHODS:
 
     @case(f"bootstrap_cm_at_thresholds_{_method}")
     def _(method=_method):

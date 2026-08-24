@@ -1,3 +1,5 @@
+use polars::prelude::*;
+use pyo3_polars::derive::polars_expr;
 use rand::distributions::Distribution;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -117,4 +119,18 @@ pub fn poisson_repeat_indices(lam: f64, size: usize, seed: Option<u64>) -> Vec<u
     }
 
     indices
+}
+
+#[polars_expr(output_type=Float64)]
+fn pl_norm_ppf(inputs: &[Series]) -> PolarsResult<Series> {
+    let ca = inputs[0].f64()?;
+
+    Ok(ca.apply_values(norm_ppf).into_series())
+}
+
+#[polars_expr(output_type=Float64)]
+fn pl_norm_cdf(inputs: &[Series]) -> PolarsResult<Series> {
+    let ca = inputs[0].f64()?;
+
+    Ok(ca.apply_values(norm_cdf).into_series())
 }

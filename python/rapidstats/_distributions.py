@@ -1,5 +1,7 @@
 from typing import Optional
 
+import polars as pl
+
 from ._rustystats import (
     _norm_cdf,
     _norm_ppf,
@@ -80,3 +82,32 @@ class Random:
         self._increment_seed()
 
         return res
+
+
+def _pl_norm_ppf(expr: pl.Expr) -> pl.Expr:
+    """Vectorised `norm.ppf` over a column.
+
+    A plugin expression rather than `map_elements(norm.ppf)`: a Python UDF runs one call
+    per element while holding the GIL, which is exactly the serialisation the extension
+    was changed to avoid.
+    """
+    from ._polars._utils import _PLUGIN_PATH
+
+    return pl.plugins.register_plugin_function(
+        plugin_path=_PLUGIN_PATH,
+        function_name="pl_norm_ppf",
+        args=[expr.cast(pl.Float64)],
+        is_elementwise=True,
+    )
+
+
+def _pl_norm_cdf(expr: pl.Expr) -> pl.Expr:
+    """Vectorised `norm.cdf` over a column. See `_pl_norm_ppf`."""
+    from ._polars._utils import _PLUGIN_PATH
+
+    return pl.plugins.register_plugin_function(
+        plugin_path=_PLUGIN_PATH,
+        function_name="pl_norm_cdf",
+        args=[expr.cast(pl.Float64)],
+        is_elementwise=True,
+    )

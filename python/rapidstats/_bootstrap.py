@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     # import graph rather than depending on polars internals.
     from polars.lazyframe.group_by import LazyGroupBy
 
-from ._distributions import Random, norm
+from ._distributions import Random, _pl_norm_cdf, _pl_norm_ppf, norm
 from ._rustystats import (
     _basic_interval,
     _bca_interval,
@@ -208,8 +208,12 @@ def _bca_interval_polars(
             .sum()
             .add(pl.col("value").le(pl.col("original_value")).sum())
             .truediv(pl.len().mul(2))
-            .map_elements(norm.ppf, return_dtype=pl.Float64)
             .alias("bias_correction_factor")
+        )
+        .with_columns(
+            _pl_norm_ppf(pl.col("bias_correction_factor")).alias(
+                "bias_correction_factor"
+            )
         )
     )
 
@@ -249,8 +253,7 @@ def _bca_interval_polars(
                 )
             )
         )
-        .map_elements(norm.cdf, return_dtype=pl.Float64)
-        .alias("lower_p"),
+        .alias("_lower_p_z"),
         pl.col("bias_correction_factor")
         .add(
             pl.col("bias_correction_factor")
@@ -263,16 +266,33 @@ def _bca_interval_polars(
                 )
             )
         )
-        .map_elements(norm.cdf, return_dtype=pl.Float64)
-        .alias("upper_p"),
+        .alias("_upper_p_z"),
+    )
+
+    p_lf = p_lf.with_columns(
+        _pl_norm_cdf(pl.col("_lower_p_z")).alias("lower_p"),
+        _pl_norm_cdf(pl.col("_upper_p_z")).alias("upper_p"),
     )
 
     return (
         bootstrap_lf.join(p_lf, on=by, how="left", validate="m:1")
         .group_by(by)
         .agg(
-            pl.col("value").quantile(pl.col("lower_p").first()).alias("lower"),
-            pl.col("value").quantile(pl.col("upper_p").first()).alias("upper"),
+            pl.col("value")
+            .quantile(pl.col("lower_p").first(), interpolation="linear")
+            .alias("lower"),
+            pl.col("value")
+            .quantile(pl.col("upper_p").first(), interpolation="linear")
+            .alias("upper"),
+        )
+        # Carry the point estimate through. Callers select `point` alongside the bounds,
+        # and this never produced one -- the code was unreachable behind a
+        # NotImplementedError, so the omission had never been exercised.
+        .join(
+            original_lf.rename({"original_value": "point"}),
+            on=by,
+            how="left",
+            validate="1:1",
         )
     )
 
@@ -717,10 +737,6 @@ class Bootstrap:
         pl.DataFrame
             A DataFrame of `threshold`, `metric`, `lower`, `mean`, and `upper`
 
-        Raises
-        ------
-        NotImplementedError
-            When `strategy` is `cum_sum` and `method` is `BCa`
 
         Added in version 0.1.0
         ----------------------
@@ -847,9 +863,6 @@ class Bootstrap:
                     .pipe(_collect)
                 )
             elif self.method == "BCa":
-                raise NotImplementedError(
-                    "Method `BCa` not implemented for strategy `cum_sum` due to https://github.com/pola-rs/polars/issues/20951"
-                )
                 original_lf = (
                     _cm_inner(df)
                     .select("threshold", *metrics)
@@ -1184,10 +1197,6 @@ class Bootstrap:
         pl.DataFrame
             A DataFrame of `threshold`, `lower`, `mean`, and `upper`
 
-        Raises
-        ------
-        NotImplementedError
-            When `strategy` is `cum_sum` and `method` is `BCa`
         """
         has_sample_weight = sample_weight is not None
         df = pl.DataFrame(
@@ -1291,9 +1300,6 @@ class Bootstrap:
                     .pipe(_collect)
                 )
             elif self.method == "BCa":
-                raise NotImplementedError(
-                    "Method `BCa` not implemented for strategy `cum_sum` due to https://github.com/pola-rs/polars/issues/20951"
-                )
                 original_lf = (
                     _air_at_thresholds_core(df, thresholds, has_sample_weight)
                     .rename({"air": "original_value"})
@@ -1305,16 +1311,23 @@ class Bootstrap:
                     thresholds=thresholds,
                     has_sample_weight=has_sample_weight,
                 )
-                jacknife_lf = (
-                    pl.concat(_jacknife(df, tmp), how="vertical")
-                    .rename({"air": "value"})
-                    .unique("threshold")
-                )
+                # `df` is a LazyFrame on the poisson path, but the jackknife indexes
+                # rows and needs a height.
+                jacknife_df = df.pipe(_collect) if isinstance(df, pl.LazyFrame) else df
+                # No `.unique("threshold")` here. The acceleration factor is computed
+                # from the spread of the leave-one-out replicates, so collapsing to one
+                # row per threshold leaves zero variance -- a zero denominator, a NaN
+                # acceleration factor, and every interval null.
+                jacknife_lf = pl.concat(
+                    _jacknife(jacknife_df, tmp, **self._concurrent_kwargs),
+                    how="vertical",
+                ).rename({"air": "value"})
 
                 return (
                     _bca_interval_polars(
                         original_lf,
-                        bootstrap_lf=bootstrap_lf.rename({"air": "value"}),
+                        # Already renamed to `value` where `bootstrap_lf` was built.
+                        bootstrap_lf=bootstrap_lf,
                         jacknife_lf=jacknife_lf,
                         alpha=self.alpha,
                         by=["threshold"],
