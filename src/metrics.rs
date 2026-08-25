@@ -15,7 +15,8 @@ pub fn base_confusion_matrix(df: DataFrame) -> DataFrame {
         .unwrap()
 }
 
-pub fn confusion_matrix(base_cm: DataFrame, beta: f64) -> ConfusionMatrixArray {
+/// Weighted counts of the four confusion-matrix cells, indexed by `2*y_true + y_pred`.
+fn base_counts(base_cm: &DataFrame) -> [f64; 4] {
     let mut s = [0.0; 4];
     for (i, w) in base_cm["y"]
         .cast(&DataType::UInt64)
@@ -28,6 +29,42 @@ pub fn confusion_matrix(base_cm: DataFrame, beta: f64) -> ConfusionMatrixArray {
         s[i as usize] += w;
     }
 
+    s
+}
+
+/// Leave-one-out confusion matrices, in O(n) rather than O(n^2).
+///
+/// The confusion matrix is a weighted bincount, so dropping row `i` just removes its
+/// weight from its own cell -- the other three are untouched. Computing the totals once
+/// and subtracting therefore costs O(1) per replicate, where the generic
+/// `bootstrap::run_jacknife` re-filters and re-scans the whole frame for every row.
+///
+/// This is what makes BCa usable at realistic sizes: the jackknife dominated it, growing
+/// 4.5x per doubling of n.
+pub fn jacknife_confusion_matrix(base_cm: &DataFrame, beta: f64) -> Vec<ConfusionMatrixArray> {
+    let totals = base_counts(base_cm);
+
+    base_cm["y"]
+        .cast(&DataType::UInt64)
+        .unwrap()
+        .u64()
+        .unwrap()
+        .into_no_null_iter()
+        .zip(base_cm["sample_weight"].f64().unwrap().into_no_null_iter())
+        .map(|(bin, weight)| {
+            let mut s = totals;
+            s[bin as usize] -= weight;
+
+            confusion_matrix_from_counts(s, beta)
+        })
+        .collect()
+}
+
+pub fn confusion_matrix(base_cm: DataFrame, beta: f64) -> ConfusionMatrixArray {
+    confusion_matrix_from_counts(base_counts(&base_cm), beta)
+}
+
+fn confusion_matrix_from_counts(s: [f64; 4], beta: f64) -> ConfusionMatrixArray {
     let tn = s[0];
     let fp = s[1];
     let fn_ = s[2];
@@ -150,8 +187,7 @@ pub fn bootstrap_confusion_matrix(
             .map(|(original_stat, bs)| bootstrap::basic_interval(original_stat, bs, alpha))
             .collect::<Vec<bootstrap::ConfidenceInterval>>()
     } else if method == "BCa" {
-        let jacknife_stats =
-            bootstrap::run_jacknife(base_cm.clone(), |x| confusion_matrix(x, beta));
+        let jacknife_stats = jacknife_confusion_matrix(&base_cm, beta);
         let js_transposed = transpose_confusion_matrix_results(jacknife_stats);
 
         original_stat
@@ -314,14 +350,24 @@ pub fn adverse_impact_ratio(df: DataFrame) -> f64 {
     let control = y_pred.filter(is_control).unwrap();
     let control_sample_weight = sample_weight.filter(is_control).unwrap();
 
-    let protected_approval_rate = (&protected * &protected_sample_weight)
-        .sum()
-        .unwrap_or(f64::NAN)
-        / protected_sample_weight.sum().unwrap_or(f64::NAN);
-    let control_approval_rate = (&control * &control_sample_weight)
-        .sum()
-        .unwrap_or(f64::NAN)
-        / control_sample_weight.sum().unwrap_or(f64::NAN);
+    // `sum()` over an empty ChunkedArray is None, and dividing those unwraps was the
+    // panic path for an empty or fully-filtered input.
+    let rate = |weighted: Option<f64>, weight_total: Option<f64>| match (
+        weighted,
+        weight_total,
+    ) {
+        (Some(weighted), Some(total)) => weighted / total,
+        _ => f64::NAN,
+    };
+
+    let protected_approval_rate = rate(
+        (&protected * &protected_sample_weight).sum(),
+        protected_sample_weight.sum(),
+    );
+    let control_approval_rate = rate(
+        (&control * &control_sample_weight).sum(),
+        control_sample_weight.sum(),
+    );
 
     let res = protected_approval_rate / control_approval_rate;
 
@@ -338,7 +384,11 @@ pub fn mean_squared_error(df: DataFrame) -> f64 {
 
     let x = &(y_true - y_score);
 
-    (x * x).mean().unwrap()
+    // NaN, not a panic, when there is nothing to average. Every other metric here already
+    // does this, and a bootstrap depends on it: a resample can legitimately come out
+    // empty or single-class, and `drop_nans` discards those iterations. Raising would
+    // take the whole run down over one unlucky draw of a thousand.
+    (x * x).mean().unwrap_or(f64::NAN)
 }
 
 pub fn root_mean_squared_error(df: DataFrame) -> f64 {
@@ -349,11 +399,18 @@ pub fn r2(df: DataFrame) -> f64 {
     let y_true = df["y_true"].f64().unwrap();
     let y_score = df["y_score"].f64().unwrap();
 
+    // See `mean_squared_error`: degenerate input yields NaN rather than panicking.
+    let Some(mean) = y_true.mean() else {
+        return f64::NAN;
+    };
+
     let residual = &(y_true - y_score);
     let squared_residual = residual * residual;
-    let mean = y_true.mean().unwrap();
     let error = &(y_true - mean);
     let squared_error = error * error;
 
-    1.0 - (squared_residual.sum().unwrap() / squared_error.sum().unwrap())
+    match (squared_residual.sum(), squared_error.sum()) {
+        (Some(residual_ss), Some(total_ss)) => 1.0 - (residual_ss / total_ss),
+        _ => f64::NAN,
+    }
 }

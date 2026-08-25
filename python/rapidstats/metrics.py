@@ -201,7 +201,7 @@ def _air_frame(y_pred, protected, control, sample_weight=None, *, data=None):
             "control": control,
             "sample_weight": 1.0 if sample_weight is None else sample_weight,
         }
-    )
+    ).with_columns(pl.col("sample_weight").cast(pl.Float64))
 
 
 def _air_score_frame(y_score, protected, control, sample_weight=None, *, data=None):
@@ -275,7 +275,14 @@ def _cm_curve_frame(y_true, y_score, sample_weight=None, *, data=None) -> pl.Laz
                 "sample_weight": 1.0 if sample_weight is None else sample_weight,
             }
         )
-        .with_columns(pl.col("y_true").cast(pl.Boolean))
+        # Cast all three, not just `y_true`. An empty input infers Null columns, and the
+        # weighted cum_sum downstream then fails with "`multiply` operation not supported
+        # for dtype `bool`" rather than returning NaN.
+        .select(
+            pl.col("y_true").cast(pl.Boolean),
+            pl.col("threshold").cast(pl.Float64),
+            pl.col("sample_weight").cast(pl.Float64),
+        )
         .drop_nulls()
     )
 
@@ -1172,17 +1179,26 @@ def average_precision(
     Added in version 0.1.0
     ----------------------
     """
-    return (
+    curve = (
         _cm_curve_frame(y_true, y_score, sample_weight, data=data)
         .pipe(_base_confusion_matrix_at_thresholds)
         .pipe(_full_confusion_matrix_from_base)
         .select("threshold", "precision", "tpr")
         .drop_nulls()
         .sort("threshold")
-        .select(_ap_from_pr_curve(pl.col("precision"), pl.col("tpr")).alias("ap"))
-        .pipe(_collect)["ap"]
-        .item()
+        .select(
+            _ap_from_pr_curve(pl.col("precision"), pl.col("tpr")).alias("ap"),
+            pl.len().alias("points"),
+        )
+        .pipe(_collect)
     )
+
+    # An empty curve sums to -0.0, which reads as a real score of zero. Every other
+    # metric here returns NaN when there is nothing to compute; match them.
+    if curve["points"].item() == 0:
+        return float("nan")
+
+    return curve["ap"].item()
 
 
 def capture_rate_at_quantiles(

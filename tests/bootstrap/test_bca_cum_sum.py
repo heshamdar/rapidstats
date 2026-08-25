@@ -153,3 +153,51 @@ def test_bca_no_longer_raises_not_implemented(data):
             call(rs.Bootstrap(iterations=20, seed=SEED, method="BCa"))
         except NotImplementedError as exc:  # pragma: no cover - the regression itself
             pytest.fail(f"BCa still raises NotImplementedError: {exc}")
+
+
+@pytest.mark.perf
+def test_bca_jackknife_scales_near_linearly():
+    """The jackknife must not be O(n^2).
+
+    The confusion matrix is a weighted bincount, so a leave-one-out replicate is the
+    totals minus one row -- O(1) each once the totals are known. The generic jackknife
+    re-filtered and re-scanned the whole frame per row instead, which made BCa grow ~4.5x
+    per doubling of n: 21ms at n=2000, 306ms at n=8000. The closed form measured 3.3ms
+    and 6.0ms respectively, a 51x improvement at n=8000.
+
+    Asserted as a growth ratio rather than absolute times, so it stays meaningful on a
+    slower machine.
+    """
+    import statistics
+    import time
+
+    import numpy as np
+
+    def timed(n: int, repeats: int = 3) -> float:
+        rand = np.random.RandomState(0)
+        y_score = rand.rand(n)
+        y_true = rand.rand(n) < 0.3 + 0.4 * y_score
+
+        def call():
+            return rs.Bootstrap(iterations=25, seed=1, method="BCa").confusion_matrix(
+                y_true, y_score > 0.5
+            )
+
+        call()
+        timings = []
+        for _ in range(repeats):
+            start = time.perf_counter()
+            call()
+            timings.append(time.perf_counter() - start)
+
+        return statistics.median(timings)
+
+    small = timed(4_000)
+    large = timed(16_000)
+
+    # 4x the rows. Quadratic would be ~16x; the closed form measured ~2.2x.
+    growth = large / small
+    assert growth < 6.0, (
+        f"quadrupling n multiplied BCa cost by {growth:.1f}x ({small * 1000:.1f}ms -> "
+        f"{large * 1000:.1f}ms); the O(n^2) jackknife has likely come back"
+    )

@@ -13,43 +13,15 @@ trait VecUtils {
     fn mean(&self) -> f64;
     fn std(&self) -> f64;
     fn drop_nans(&self) -> Vec<f64>;
-    fn percentile(&self, q: f64) -> f64;
+    fn sorted(&self) -> Vec<f64>;
 }
 
 impl VecUtils for Vec<f64> {
-    #[allow(clippy::manual_range_contains)]
-    fn percentile(&self, q: f64) -> f64 {
-        if self.is_empty() {
-            return f64::NAN;
-        }
-
-        if q < 0.0 || q > 100.0 {
-            panic!("Percentile must be between 0 and 100");
-        }
-
+    fn sorted(&self) -> Vec<f64> {
         let mut sorted_data = self.clone();
         sorted_data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
-        if q == 0.0 {
-            return sorted_data[0];
-        }
-        if q == 100.0 {
-            return sorted_data[sorted_data.len() - 1];
-        }
-
-        let rank = (q / 100.0) * (sorted_data.len() - 1) as f64;
-        let lower_index = rank.floor() as usize;
-        let upper_index = rank.ceil() as usize;
-
-        if lower_index == upper_index {
-            sorted_data[lower_index]
-        } else {
-            let lower_value = sorted_data[lower_index];
-            let upper_value = sorted_data[upper_index];
-            let fraction = rank - lower_index as f64;
-
-            lower_value + (upper_value - lower_value) * fraction
-        }
+        sorted_data
     }
 
     fn drop_nans(&self) -> Vec<f64> {
@@ -74,6 +46,44 @@ impl VecUtils for Vec<f64> {
             self.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (self.len() - 1) as f64;
 
         variance.sqrt()
+    }
+}
+
+/// Linear-interpolated percentile of an already-sorted slice.
+///
+/// Taking the sorted data rather than sorting internally lets a caller wanting several
+/// percentiles of the same vector sort once. Every interval method wants two bounds, and
+/// the confusion-matrix bootstrap runs one for each of 27 metrics -- which was 54 sorts
+/// of the same vectors per call.
+#[allow(clippy::manual_range_contains)]
+fn percentile_of_sorted(sorted_data: &[f64], q: f64) -> f64 {
+    if sorted_data.is_empty() {
+        return f64::NAN;
+    }
+
+    if q < 0.0 || q > 100.0 {
+        panic!("Percentile must be between 0 and 100");
+    }
+
+    if q == 0.0 {
+        return sorted_data[0];
+    }
+    if q == 100.0 {
+        return sorted_data[sorted_data.len() - 1];
+    }
+
+    let rank = (q / 100.0) * (sorted_data.len() - 1) as f64;
+    let lower_index = rank.floor() as usize;
+    let upper_index = rank.ceil() as usize;
+
+    if lower_index == upper_index {
+        sorted_data[lower_index]
+    } else {
+        let lower_value = sorted_data[lower_index];
+        let upper_value = sorted_data[upper_index];
+        let fraction = rank - lower_index as f64;
+
+        lower_value + (upper_value - lower_value) * fraction
     }
 }
 
@@ -351,12 +361,12 @@ pub fn percentile_interval(
     bootstrap_stats: Vec<f64>,
     alpha: f64,
 ) -> ConfidenceInterval {
-    let runs = bootstrap_stats.drop_nans();
+    let runs = bootstrap_stats.drop_nans().sorted();
 
     (
-        runs.percentile(alpha * 100.0),
+        percentile_of_sorted(&runs, alpha * 100.0),
         original_stat,
-        runs.percentile((1.0 - alpha) * 100.0),
+        percentile_of_sorted(&runs, (1.0 - alpha) * 100.0),
     )
 }
 
@@ -417,9 +427,11 @@ pub fn bca_interval(
                 / (1.0 - acceleration_factor * (bias_correction_factor + z2)),
     );
 
+    let sorted_stats = bootstrap_stats.sorted();
+
     (
-        bootstrap_stats.percentile(lower_p * 100.0),
+        percentile_of_sorted(&sorted_stats, lower_p * 100.0),
         original_stat,
-        bootstrap_stats.percentile(upper_p * 100.0),
+        percentile_of_sorted(&sorted_stats, upper_p * 100.0),
     )
 }
