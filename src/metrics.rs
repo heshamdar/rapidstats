@@ -168,40 +168,68 @@ pub fn bootstrap_confusion_matrix(
 
     let original_stat = confusion_matrix(base_cm.clone(), beta);
 
+    // The confusion matrix is a weighted bincount: it always has an answer, even from no
+    // rows (every cell zero, every rate 0/0). So its replicates are never absent, only
+    // undefined -- wrap them as present and let the interval code drop the NaNs.
+    let bs_transposed: Vec<Vec<Option<f64>>> = bs_transposed
+        .into_iter()
+        .map(|bs| bs.into_iter().map(Some).collect())
+        .collect();
+
     if method == "standard" {
         bs_transposed
             .into_iter()
             .zip(original_stat)
-            .map(|(bs, o)| bootstrap::standard_interval(o, bs, alpha))
+            .map(|(bs, o)| bootstrap::standard_interval(Some(o), bs, alpha))
             .collect::<Vec<bootstrap::ConfidenceInterval>>()
     } else if method == "percentile" {
         bs_transposed
             .into_iter()
             .zip(original_stat)
-            .map(|(bs, o)| bootstrap::percentile_interval(o, bs, alpha))
+            .map(|(bs, o)| bootstrap::percentile_interval(Some(o), bs, alpha))
             .collect::<Vec<bootstrap::ConfidenceInterval>>()
     } else if method == "basic" {
         original_stat
             .into_iter()
             .zip(bs_transposed)
-            .map(|(original_stat, bs)| bootstrap::basic_interval(original_stat, bs, alpha))
+            .map(|(original_stat, bs)| bootstrap::basic_interval(Some(original_stat), bs, alpha))
             .collect::<Vec<bootstrap::ConfidenceInterval>>()
     } else if method == "BCa" {
         let jacknife_stats = jacknife_confusion_matrix(&base_cm, beta);
-        let js_transposed = transpose_confusion_matrix_results(jacknife_stats);
+        let js_transposed: Vec<Vec<Option<f64>>> =
+            transpose_confusion_matrix_results(jacknife_stats)
+                .into_iter()
+                .map(|js| js.into_iter().map(Some).collect())
+                .collect();
 
         original_stat
             .into_iter()
             .zip(bs_transposed)
             .zip(js_transposed)
-            .map(|((original_stat, bs), js)| bootstrap::bca_interval(original_stat, bs, js, alpha))
+            .map(|((original_stat, bs), js)| {
+                bootstrap::bca_interval(Some(original_stat), bs, js, alpha)
+            })
             .collect::<Vec<bootstrap::ConfidenceInterval>>()
     } else {
         panic!("Invalid method");
     }
 }
 
-pub fn roc_auc_sorted(df: DataFrame) -> f64 {
+/// Absent is `None`; undefined is `NaN`.
+///
+/// A metric with no rows to read has no answer at all, and that is a null -- polars
+/// spells it `None` here and Python sees `None`. A metric with rows whose formula
+/// divides by zero (`roc_auc` on a single class, `tpr` with no positives) has a real,
+/// undefined answer, and that is `NaN`. Conflating the two hands the caller a float that
+/// looks like a computed result when nothing was computed.
+///
+/// The bootstrap relies on the first half: a resample can come out empty, and those
+/// iterations are skipped rather than poisoning the interval.
+pub fn roc_auc_sorted(df: DataFrame) -> Option<f64> {
+    if df.height() == 0 {
+        return None;
+    }
+
     let y_true = df["y_true"].f64().unwrap();
     let y_score = df["y_score"].f64().unwrap();
     let sample_weight = df["sample_weight"].f64().unwrap();
@@ -245,10 +273,11 @@ pub fn roc_auc_sorted(df: DataFrame) -> f64 {
         i = j;
     }
 
-    auc / (n_false * n_true)
+    // Single-class input leaves one of these at zero: 0/0, genuinely undefined, NaN.
+    Some(auc / (n_false * n_true))
 }
 
-pub fn roc_auc(df: DataFrame) -> f64 {
+pub fn roc_auc(df: DataFrame) -> Option<f64> {
     let df = df.sort(["y_score"], Default::default()).unwrap();
 
     roc_auc_sorted(df)
@@ -303,11 +332,17 @@ fn ks_2samp(v1: &[f64], v2: &[f64]) -> f64 {
     }
 }
 
-pub fn max_ks(df: DataFrame) -> f64 {
+pub fn max_ks(df: DataFrame) -> Option<f64> {
+    if df.height() == 0 {
+        return None;
+    }
+
     let y_score = df["y_score"].f64().unwrap();
     let y_true = df["y_true"].bool().unwrap();
 
-    ks_2samp(
+    // A single-class input leaves one sample empty: the statistic is undefined rather
+    // than absent, so `ks_2samp` returns NaN and that is what comes back.
+    Some(ks_2samp(
         y_score
             .filter(y_true)
             .unwrap()
@@ -320,10 +355,10 @@ pub fn max_ks(df: DataFrame) -> f64 {
             .sort(false)
             .cont_slice()
             .unwrap(),
-    )
+    ))
 }
 
-pub fn brier_loss(df: DataFrame) -> f64 {
+pub fn brier_loss(df: DataFrame) -> Option<f64> {
     df.lazy()
         .with_column((col("y_true") - col("y_score")).pow(2).alias("x"))
         .collect()
@@ -333,14 +368,17 @@ pub fn brier_loss(df: DataFrame) -> f64 {
         .f64()
         .unwrap()
         .mean()
-        .unwrap_or(f64::NAN)
 }
 
-pub fn mean(df: DataFrame) -> f64 {
-    df["y"].as_series().unwrap().mean().unwrap_or(f64::NAN)
+pub fn mean(df: DataFrame) -> Option<f64> {
+    df["y"].as_series().unwrap().mean()
 }
 
-pub fn adverse_impact_ratio(df: DataFrame) -> f64 {
+pub fn adverse_impact_ratio(df: DataFrame) -> Option<f64> {
+    if df.height() == 0 {
+        return None;
+    }
+
     let is_protected = df["protected"].bool().unwrap();
     let is_control = df["control"].bool().unwrap();
     let y_pred = df["y_pred"].f64().unwrap();
@@ -351,7 +389,8 @@ pub fn adverse_impact_ratio(df: DataFrame) -> f64 {
     let control_sample_weight = sample_weight.filter(is_control).unwrap();
 
     // `sum()` over an empty ChunkedArray is None, and dividing those unwraps was the
-    // panic path for an empty or fully-filtered input.
+    // panic path for a fully-filtered input. There are rows here -- just none in this
+    // group -- so the rate is undefined rather than absent.
     let rate = |weighted: Option<f64>, weight_total: Option<f64>| match (
         weighted,
         weight_total,
@@ -371,46 +410,38 @@ pub fn adverse_impact_ratio(df: DataFrame) -> f64 {
 
     let res = protected_approval_rate / control_approval_rate;
 
-    if res.is_infinite() {
-        f64::NAN
-    } else {
-        res
-    }
+    Some(if res.is_infinite() { f64::NAN } else { res })
 }
 
-pub fn mean_squared_error(df: DataFrame) -> f64 {
+pub fn mean_squared_error(df: DataFrame) -> Option<f64> {
     let y_true = df["y_true"].f64().unwrap();
     let y_score = df["y_score"].f64().unwrap();
 
     let x = &(y_true - y_score);
 
-    // NaN, not a panic, when there is nothing to average. Every other metric here already
-    // does this, and a bootstrap depends on it: a resample can legitimately come out
-    // empty or single-class, and `drop_nans` discards those iterations. Raising would
-    // take the whole run down over one unlucky draw of a thousand.
-    (x * x).mean().unwrap_or(f64::NAN)
+    // `mean()` of nothing is None, not a panic and not NaN: there is no error to average.
+    (x * x).mean()
 }
 
-pub fn root_mean_squared_error(df: DataFrame) -> f64 {
-    mean_squared_error(df).sqrt()
+pub fn root_mean_squared_error(df: DataFrame) -> Option<f64> {
+    mean_squared_error(df).map(f64::sqrt)
 }
 
-pub fn r2(df: DataFrame) -> f64 {
+pub fn r2(df: DataFrame) -> Option<f64> {
     let y_true = df["y_true"].f64().unwrap();
     let y_score = df["y_score"].f64().unwrap();
 
-    // See `mean_squared_error`: degenerate input yields NaN rather than panicking.
-    let Some(mean) = y_true.mean() else {
-        return f64::NAN;
-    };
+    // No rows, no mean, no R2 -- absent rather than undefined.
+    let mean = y_true.mean()?;
 
     let residual = &(y_true - y_score);
     let squared_residual = residual * residual;
     let error = &(y_true - mean);
     let squared_error = error * error;
 
+    // Zero variance in `y_true` makes `total_ss` zero: 1 - 0/0 is undefined, so NaN.
     match (squared_residual.sum(), squared_error.sum()) {
-        (Some(residual_ss), Some(total_ss)) => 1.0 - (residual_ss / total_ss),
-        _ => f64::NAN,
+        (Some(residual_ss), Some(total_ss)) => Some(1.0 - (residual_ss / total_ss)),
+        _ => None,
     }
 }

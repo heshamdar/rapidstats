@@ -21,7 +21,7 @@ static ALLOC: PolarsAllocator = PolarsAllocator::new();
 macro_rules! generate_functions {
     ($func_name:ident, $metric_func:path) => {
         #[pyfunction]
-        fn $func_name(py: Python<'_>, df: PyDataFrame) -> PyResult<f64> {
+        fn $func_name(py: Python<'_>, df: PyDataFrame) -> PyResult<Option<f64>> {
             let df: DataFrame = df.into();
 
             Ok(py.allow_threads(move || $metric_func(df)))
@@ -131,8 +131,8 @@ generate_functions!(_r2, metrics::r2);
 #[pyfunction]
 fn _standard_interval(
     py: Python<'_>,
-    original_stat: f64,
-    bootstrap_stats: Vec<f64>,
+    original_stat: Option<f64>,
+    bootstrap_stats: Vec<Option<f64>>,
     alpha: f64,
 ) -> PyResult<ConfidenceInterval> {
     Ok(py.allow_threads(move || {
@@ -143,8 +143,8 @@ fn _standard_interval(
 #[pyfunction]
 fn _percentile_interval(
     py: Python<'_>,
-    original_stat: f64,
-    bootstrap_stats: Vec<f64>,
+    original_stat: Option<f64>,
+    bootstrap_stats: Vec<Option<f64>>,
     alpha: f64,
 ) -> PyResult<ConfidenceInterval> {
     Ok(py.allow_threads(move || {
@@ -155,8 +155,8 @@ fn _percentile_interval(
 #[pyfunction]
 fn _basic_interval(
     py: Python<'_>,
-    original_stat: f64,
-    bootstrap_stats: Vec<f64>,
+    original_stat: Option<f64>,
+    bootstrap_stats: Vec<Option<f64>>,
     alpha: f64,
 ) -> PyResult<ConfidenceInterval> {
     Ok(py.allow_threads(move || {
@@ -167,9 +167,9 @@ fn _basic_interval(
 #[pyfunction]
 fn _bca_interval(
     py: Python<'_>,
-    original_stat: f64,
-    bootstrap_stats: Vec<f64>,
-    jacknife_stats: Vec<f64>,
+    original_stat: Option<f64>,
+    bootstrap_stats: Vec<Option<f64>>,
+    jacknife_stats: Vec<Option<f64>>,
     alpha: f64,
 ) -> PyResult<ConfidenceInterval> {
     Ok(py.allow_threads(move || {

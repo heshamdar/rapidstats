@@ -332,7 +332,7 @@ def roc_auc(
     sample_weight: Optional[ArrayLike] = None,
     *,
     data=None,
-) -> float:
+) -> Optional[float]:
     """Computes Area Under the Receiver Operating Characteristic Curve.
 
     Parameters
@@ -349,8 +349,8 @@ def roc_auc(
 
     Returns
     -------
-    float
-        ROC-AUC
+    Optional[float]
+        ROC-AUC, or `None` if there is nothing to compute it from
 
     Added in version 0.1.0
     ----------------------
@@ -362,7 +362,7 @@ def roc_auc(
     return _roc_auc(df)
 
 
-def max_ks(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
+def max_ks(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> Optional[float]:
     """Performs the two-sample Kolmogorov-Smirnov test on the predicted scores of the
     ground truth positive and ground truth negative classes. The KS test measures the
     highest distance between two CDFs, so the Max-KS metric measures how well the model
@@ -385,8 +385,8 @@ def max_ks(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
 
     Returns
     -------
-    float
-        Max-KS
+    Optional[float]
+        Max-KS, or `None` if there is nothing to compute it from
 
     Added in version 0.1.0
     ----------------------
@@ -396,7 +396,7 @@ def max_ks(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
     return _max_ks(df)
 
 
-def brier_loss(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
+def brier_loss(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> Optional[float]:
     r"""Computes the Brier loss (smaller is better). The Brier loss measures the mean
     squared difference between the predicted scores and the ground truth target.
     Calculated as:
@@ -414,8 +414,8 @@ def brier_loss(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
 
     Returns
     -------
-    float
-        Brier loss
+    Optional[float]
+        Brier loss, or `None` if there is nothing to compute it from
 
     Added in version 0.1.0
     ----------------------
@@ -425,7 +425,7 @@ def brier_loss(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
     return _brier_loss(df)
 
 
-def mean(y: ArrayLike, *, data=None) -> float:
+def mean(y: ArrayLike, *, data=None) -> Optional[float]:
     """Computes the mean of the input array.
 
     Parameters
@@ -435,8 +435,8 @@ def mean(y: ArrayLike, *, data=None) -> float:
 
     Returns
     -------
-    float
-        Mean
+    Optional[float]
+        Mean, or `None` if there is nothing to compute it from
 
     Added in version 0.1.0
     ----------------------
@@ -548,7 +548,7 @@ def adverse_impact_ratio(
     sample_weight: Optional[ArrayLike] = None,
     *,
     data=None,
-) -> float:
+) -> Optional[float]:
     """Computes the Adverse Impact Ratio (AIR), which is the ratio of negative
     predictions for the protected class and the control class. The ideal ratio is 1.
     For example, in an underwriting context, this means that the model is equally as
@@ -571,8 +571,8 @@ def adverse_impact_ratio(
 
     Returns
     -------
-    float
-        Adverse Impact Ratio (AIR)
+    Optional[float]
+        Adverse Impact Ratio (AIR), or `None` if there is nothing to compute it from
 
     Added in version 0.1.0
     ----------------------
@@ -767,7 +767,9 @@ def adverse_impact_ratio_at_thresholds(
     return res if lazy else _collect(res)
 
 
-def mean_squared_error(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
+def mean_squared_error(
+    y_true: ArrayLike, y_score: ArrayLike, *, data=None
+) -> Optional[float]:
     r"""Computes Mean Squared Error (MSE) as
 
     \[ \frac{1}{N} \sum_{i=1}^{N} (yt_i - ys_i)^2 \]
@@ -783,8 +785,8 @@ def mean_squared_error(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> f
 
     Returns
     -------
-    float
-        Mean Squared Error (MSE)
+    Optional[float]
+        Mean Squared Error (MSE), or `None` if there is nothing to compute it from
 
     Added in version 0.1.0
     ----------------------
@@ -794,7 +796,7 @@ def mean_squared_error(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> f
 
 def root_mean_squared_error(
     y_true: ArrayLike, y_score: ArrayLike, *, data=None
-) -> float:
+) -> Optional[float]:
     r"""Computes Root Mean Squared Error (RMSE) as
 
     \[ \sqrt{\frac{1}{N} \sum_{i=1}^{N} (yt_i - ys_i)^2} \]
@@ -810,8 +812,8 @@ def root_mean_squared_error(
 
     Returns
     -------
-    float
-        Root Mean Squared Error (RMSE)
+    Optional[float]
+        Root Mean Squared Error (RMSE), or `None` if there is nothing to compute it from
 
     Added in version 0.1.0
     ----------------------
@@ -1156,7 +1158,7 @@ def average_precision(
     sample_weight: Optional[ArrayLike] = None,
     *,
     data=None,
-) -> float:
+) -> Optional[float]:
     """Computes Average Precision.
 
     Parameters
@@ -1173,8 +1175,8 @@ def average_precision(
 
     Returns
     -------
-    float
-        Average Precision (AP)
+    Optional[float]
+        Average Precision (AP), or `None` if there is nothing to compute it from
 
     Added in version 0.1.0
     ----------------------
@@ -1193,10 +1195,11 @@ def average_precision(
         .pipe(_collect)
     )
 
-    # An empty curve sums to -0.0, which reads as a real score of zero. Every other
-    # metric here returns NaN when there is nothing to compute; match them.
+    # An empty curve sums to -0.0, which reads as a real score of zero. Nothing was
+    # computed, so say so with a null rather than a number -- or a NaN, which here would
+    # claim the arithmetic was undefined when there was no arithmetic at all.
     if curve["points"].item() == 0:
-        return float("nan")
+        return None
 
     return curve["ap"].item()
 
@@ -1237,7 +1240,7 @@ def capture_rate_at_quantiles(
     return lf if lazy else _collect(lf)
 
 
-def r2(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
+def r2(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> Optional[float]:
     r"""Computes R2 as
 
     \[
@@ -1253,8 +1256,8 @@ def r2(y_true: ArrayLike, y_score: ArrayLike, *, data=None) -> float:
 
     Returns
     -------
-    float
-        R2
+    Optional[float]
+        R2, or `None` if there is nothing to compute it from
 
     Added in version 0.1.0
     ----------------------

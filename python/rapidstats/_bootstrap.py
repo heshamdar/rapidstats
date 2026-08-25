@@ -59,8 +59,13 @@ from .metrics import (
 )
 from .metrics import average_precision as _ap
 
-ConfidenceInterval = tuple[float, float, float]
-StatFunc = Callable[[pl.DataFrame], float]
+# `(lower, point, upper)`. A bound is `None` when there was nothing to compute it from --
+# no usable replicate survived -- and NaN only when the arithmetic itself is undefined on
+# real data (`tpr` with no positives, `roc_auc` on a single class).
+ConfidenceInterval = tuple[Optional[float], Optional[float], Optional[float]]
+# `None` is allowed and means the resample had nothing to compute from; such iterations
+# are skipped rather than taking the run down.
+StatFunc = Callable[[pl.DataFrame], Optional[float]]
 
 
 @dataclasses.dataclass
@@ -130,6 +135,16 @@ class BootstrappedConfusionMatrix:
                 "upper": upper,
             }
         )
+
+
+def _usable(stats: Iterable) -> list[float]:
+    """The replicates an interval can be computed from.
+
+    Drops the absent ones -- a `stat_func` that found no rows to read returns `None` --
+    and the undefined ones, whose NaN cannot be ordered and so would make every
+    percentile of the vector NaN.
+    """
+    return [x for x in stats if x is not None and not math.isnan(x)]
 
 
 def _bs_func(i: int, df: pl.DataFrame, stat_func):
@@ -599,7 +614,8 @@ class Bootstrap:
             The data to pass to `stat_func`
         stat_func : StatFunc
             A callable that takes a Polars DataFrame as its first argument and returns
-            a scalar real number.
+            a scalar real number, or `None` if this resample had nothing to compute
+            from. `None` and NaN iterations are both skipped.
 
         Returns
         -------
@@ -627,14 +643,14 @@ class Bootstrap:
         else:
             iterable = (self.seed + i for i in range(self.iterations))
 
-        bootstrap_stats = [
-            x for x in _run_concurrent(func, iterable, **kwargs) if not math.isnan(x)
-        ]
+        bootstrap_stats = _usable(_run_concurrent(func, iterable, **kwargs))
 
         original_stat = stat_func(df)
 
+        # Nothing usable to take an interval from: absent, so null rather than NaN. The
+        # point estimate is passed through as it came back -- it may itself be undefined.
         if len(bootstrap_stats) == 0:
-            return (math.nan, math.nan, math.nan)
+            return (None, original_stat, None)
 
         if self.method == "standard":
             return _standard_interval(original_stat, bootstrap_stats, self.alpha)
@@ -643,11 +659,9 @@ class Bootstrap:
         elif self.method == "basic":
             return _basic_interval(original_stat, bootstrap_stats, self.alpha)
         elif self.method == "BCa":
-            jacknife_stats = [
-                x
-                for x in _jacknife(df, stat_func, **self._concurrent_kwargs)
-                if not math.isnan(x)
-            ]
+            jacknife_stats = _usable(
+                _jacknife(df, stat_func, **self._concurrent_kwargs)
+            )
 
             return _bca_interval(
                 original_stat, bootstrap_stats, jacknife_stats, self.alpha

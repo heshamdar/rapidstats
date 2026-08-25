@@ -4,7 +4,13 @@ use polars::prelude::*;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::prelude::*;
 
-pub type ConfidenceInterval = (f64, f64, f64);
+/// `(lower, point, upper)`, each absent when there was nothing to compute it from.
+///
+/// A bound is `None` when no usable replicate survived -- an empty input, or a bootstrap
+/// whose every resample came out degenerate. It is `NaN` only when the arithmetic itself
+/// is undefined on real data. Python sees `None` for the first and `float('nan')` for the
+/// second, which is the distinction the caller needs to tell "no data" from "no answer".
+pub type ConfidenceInterval = (Option<f64>, Option<f64>, Option<f64>);
 
 // The resulting bootstrap vectors are small vectors, usually around 500-10_000 in
 // length, so let's just operate on these vectors directly instead of converting into
@@ -12,8 +18,16 @@ pub type ConfidenceInterval = (f64, f64, f64);
 trait VecUtils {
     fn mean(&self) -> f64;
     fn std(&self) -> f64;
-    fn drop_nans(&self) -> Vec<f64>;
     fn sorted(&self) -> Vec<f64>;
+}
+
+/// The replicates an interval can actually be computed from.
+///
+/// Drops the absent ones (a resample with no rows) and the undefined ones (a resample
+/// that had rows but no answer -- single-class, zero-variance). Both have to go: a NaN
+/// cannot be ordered, so leaving one in makes every percentile of the vector NaN.
+fn usable(stats: Vec<Option<f64>>) -> Vec<f64> {
+    stats.into_iter().flatten().filter(|x| !x.is_nan()).collect()
 }
 
 impl VecUtils for Vec<f64> {
@@ -22,11 +36,6 @@ impl VecUtils for Vec<f64> {
         sorted_data.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
         sorted_data
-    }
-
-    fn drop_nans(&self) -> Vec<f64> {
-        // copied is a no-op for f64
-        self.iter().copied().filter(|x| !x.is_nan()).collect()
     }
 
     fn mean(&self) -> f64 {
@@ -56,9 +65,9 @@ impl VecUtils for Vec<f64> {
 /// the confusion-matrix bootstrap runs one for each of 27 metrics -- which was 54 sorts
 /// of the same vectors per call.
 #[allow(clippy::manual_range_contains)]
-fn percentile_of_sorted(sorted_data: &[f64], q: f64) -> f64 {
+fn percentile_of_sorted(sorted_data: &[f64], q: f64) -> Option<f64> {
     if sorted_data.is_empty() {
-        return f64::NAN;
+        return None;
     }
 
     if q < 0.0 || q > 100.0 {
@@ -66,17 +75,17 @@ fn percentile_of_sorted(sorted_data: &[f64], q: f64) -> f64 {
     }
 
     if q == 0.0 {
-        return sorted_data[0];
+        return Some(sorted_data[0]);
     }
     if q == 100.0 {
-        return sorted_data[sorted_data.len() - 1];
+        return Some(sorted_data[sorted_data.len() - 1]);
     }
 
     let rank = (q / 100.0) * (sorted_data.len() - 1) as f64;
     let lower_index = rank.floor() as usize;
     let upper_index = rank.ceil() as usize;
 
-    if lower_index == upper_index {
+    Some(if lower_index == upper_index {
         sorted_data[lower_index]
     } else {
         let lower_value = sorted_data[lower_index];
@@ -84,7 +93,7 @@ fn percentile_of_sorted(sorted_data: &[f64], q: f64) -> f64 {
         let fraction = rank - lower_index as f64;
 
         lower_value + (upper_value - lower_value) * fraction
-    }
+    })
 }
 
 // fn repeat<T: Copy>(a: &[T], repeats: &[u64], capacity: usize) -> Vec<T> {
@@ -339,11 +348,19 @@ where
 }
 
 pub fn standard_interval(
-    original_stat: f64,
-    bootstrap_stats: Vec<f64>,
+    original_stat: Option<f64>,
+    bootstrap_stats: Vec<Option<f64>>,
     alpha: f64,
 ) -> ConfidenceInterval {
-    let runs = bootstrap_stats.drop_nans();
+    let runs = usable(bootstrap_stats);
+
+    // Fewer than two usable replicates leaves no standard error to scale, and no point
+    // estimate leaves nothing to centre on: absent, not undefined.
+    if runs.len() < 2 || original_stat.is_none() {
+        return (None, original_stat, None);
+    }
+
+    let original_stat = original_stat.unwrap();
     let stderr = runs.std();
     let z = distributions::norm_ppf(1.0 - alpha);
     let x = z * stderr;
@@ -353,15 +370,19 @@ pub fn standard_interval(
     // still reporting `original_stat` as the point, so on a skewed bootstrap
     // distribution the reported point sat off-centre in its own interval -- and could
     // fall outside it.
-    (original_stat - x, original_stat, original_stat + x)
+    (
+        Some(original_stat - x),
+        Some(original_stat),
+        Some(original_stat + x),
+    )
 }
 
 pub fn percentile_interval(
-    original_stat: f64,
-    bootstrap_stats: Vec<f64>,
+    original_stat: Option<f64>,
+    bootstrap_stats: Vec<Option<f64>>,
     alpha: f64,
 ) -> ConfidenceInterval {
-    let runs = bootstrap_stats.drop_nans().sorted();
+    let runs = usable(bootstrap_stats).sorted();
 
     (
         percentile_of_sorted(&runs, alpha * 100.0),
@@ -371,17 +392,17 @@ pub fn percentile_interval(
 }
 
 pub fn basic_interval(
-    original_stat: f64,
-    bootstrap_stats: Vec<f64>,
+    original_stat: Option<f64>,
+    bootstrap_stats: Vec<Option<f64>>,
     alpha: f64,
 ) -> ConfidenceInterval {
-    let interval = percentile_interval(original_stat, bootstrap_stats, alpha);
-    let lower = interval.0;
-    let upper = interval.2;
+    let (lower, point, upper) = percentile_interval(original_stat, bootstrap_stats, alpha);
 
-    let x = 2.0 * original_stat;
+    let Some(x) = point.map(|p| 2.0 * p) else {
+        return (None, point, None);
+    };
 
-    (x - upper, original_stat, x - lower)
+    (upper.map(|u| x - u), point, lower.map(|l| x - l))
 }
 
 fn percentile_of_score(arr: &[f64], score: f64) -> f64 {
@@ -392,13 +413,22 @@ fn percentile_of_score(arr: &[f64], score: f64) -> f64 {
 }
 
 pub fn bca_interval(
-    original_stat: f64,
-    bootstrap_stats: Vec<f64>,
-    jacknife_stats: Vec<f64>,
+    original_stat: Option<f64>,
+    bootstrap_stats: Vec<Option<f64>>,
+    jacknife_stats: Vec<Option<f64>>,
     alpha: f64,
 ) -> ConfidenceInterval {
-    let bootstrap_stats = bootstrap_stats.drop_nans();
-    let jacknife_stats = jacknife_stats.drop_nans();
+    let bootstrap_stats = usable(bootstrap_stats);
+    let jacknife_stats = usable(jacknife_stats);
+
+    // The bias correction needs a point estimate to rank, and the acceleration needs
+    // jackknife replicates to take a third moment of. Without either there is no
+    // interval to report.
+    if bootstrap_stats.is_empty() || jacknife_stats.is_empty() || original_stat.is_none() {
+        return (None, original_stat, None);
+    }
+
+    let original_stat = original_stat.unwrap();
     let z1 = distributions::norm_ppf(alpha);
     let z2 = -z1;
 
@@ -431,7 +461,7 @@ pub fn bca_interval(
 
     (
         percentile_of_sorted(&sorted_stats, lower_p * 100.0),
-        original_stat,
+        Some(original_stat),
         percentile_of_sorted(&sorted_stats, upper_p * 100.0),
     )
 }

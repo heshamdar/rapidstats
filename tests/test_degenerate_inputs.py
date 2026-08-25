@@ -1,23 +1,29 @@
-"""Degenerate inputs must return NaN, not abort the interpreter.
+"""Absent is null; undefined is NaN.
 
-Most metrics already return NaN when there is nothing to compute -- `roc_auc`,
-`brier_loss`, `mean`, `max_ks` and `confusion_matrix` all do. Four did not:
-`mean_squared_error`, `root_mean_squared_error`, `r2` and `adverse_impact_ratio` called
-`.unwrap()` on an empty aggregate and raised `pyo3_runtime.PanicException`, a
-`BaseException` that ordinary `except Exception` handling does not catch.
+Two different things get conflated when a metric has nothing useful to return, and they
+deserve two different answers:
 
-NaN rather than a raised error is the right answer, and not only for consistency: a
-bootstrap resample can legitimately come out degenerate -- every row one class, or a
-Poisson draw that keeps almost nothing -- and `drop_nans` already discards those
-iterations. A metric that raised instead would take the whole bootstrap down because one
-of a thousand resamples was unlucky.
+- **Nothing to compute.** Empty input, all-null input, an input that filters away to
+  nothing. There is no number here, and the polars way to say that is `null` -- surfaced
+  to Python as `None`. Every frame-returning path in this library already says it that
+  way; the scalar metrics used to say `NaN` instead, which is the same word polars uses
+  for a real (if undefined) float.
+- **Undefined arithmetic.** There *is* data, and the formula divides by zero: `tpr` when
+  no row is positive, `roc_auc` when every label is the same class, `r2` when `y_true`
+  has no variance. That is what NaN means, and it stays NaN.
+
+So the rule these tests pin is: a metric returns `None` when its (cleaned) input is
+empty, and otherwise returns the arithmetic result, NaN included.
+
+The bootstrap depends on the first half: a resample can legitimately come out empty or
+single-class, and those iterations are skipped rather than taking the whole run down.
 """
 
 from __future__ import annotations
 
 import math
 
-import numpy as np
+import polars as pl
 import pytest
 
 import rapidstats as rs
@@ -34,36 +40,63 @@ BINARY_METRICS = {
 }
 
 
-def _is_missing(value) -> bool:
-    return value is None or (isinstance(value, float) and math.isnan(value))
+def _is_nan(value) -> bool:
+    return isinstance(value, float) and math.isnan(value)
 
 
 @pytest.mark.parametrize("name", sorted(BINARY_METRICS))
-def test_empty_input_returns_nan(name):
+def test_empty_input_returns_none(name):
     result = BINARY_METRICS[name]([], [])
 
-    assert _is_missing(result), f"{name} on empty input returned {result!r}"
+    assert result is None, f"{name} on empty input returned {result!r}, expected None"
 
 
 @pytest.mark.parametrize("name", sorted(BINARY_METRICS))
-def test_all_null_input_returns_nan(name):
+def test_all_null_input_returns_none(name):
     """Nulls are dropped first, so this reduces to the empty case."""
     result = BINARY_METRICS[name]([None, None, None], [None, None, None])
 
-    assert _is_missing(result), f"{name} on all-null input returned {result!r}"
+    assert result is None, (
+        f"{name} on all-null input returned {result!r}, expected None"
+    )
 
 
-def test_empty_confusion_matrix_is_all_nan_or_zero():
+def test_empty_mean_returns_none():
+    assert rs.metrics.mean([]) is None
+
+
+def test_empty_adverse_impact_ratio_returns_none():
+    assert rs.metrics.adverse_impact_ratio([], [], []) is None
+
+
+def test_empty_confusion_matrix_counts_zero_and_rates_nan():
+    """A weighted bincount of nothing really is zero; the rates really are 0/0."""
     result = rs.metrics.confusion_matrix([], [])
 
     assert result.tp == 0.0
-    assert _is_missing(result.tpr)
+    assert result.tn == 0.0
+    assert _is_nan(result.tpr)
+    assert _is_nan(result.precision)
 
 
-def test_empty_adverse_impact_ratio_returns_nan():
-    result = rs.metrics.adverse_impact_ratio([], [], [])
+def test_single_class_roc_auc_is_nan_not_none():
+    """There is data -- there are just no discordant pairs to rank, so 0/0."""
+    result = rs.metrics.roc_auc([True, True, True], [0.1, 0.5, 0.9])
 
-    assert _is_missing(result)
+    assert _is_nan(result), f"expected NaN, got {result!r}"
+
+
+def test_single_class_max_ks_is_nan_not_none():
+    result = rs.metrics.max_ks([True, True, True], [0.1, 0.5, 0.9])
+
+    assert _is_nan(result), f"expected NaN, got {result!r}"
+
+
+def test_zero_variance_r2_is_nan_not_none():
+    """`y_true` constant and predicted exactly: 1 - 0/0."""
+    result = rs.metrics.r2([1.0, 1.0], [1.0, 1.0])
+
+    assert _is_nan(result), f"expected NaN, got {result!r}"
 
 
 def test_single_row_metrics_do_not_crash():
@@ -73,20 +106,20 @@ def test_single_row_metrics_do_not_crash():
         assert isinstance(result, float), f"{name} returned {result!r}"
 
 
-def test_empty_bootstrap_returns_nan_interval():
+def test_empty_bootstrap_returns_null_interval():
     lower, point, upper = rs.Bootstrap(iterations=5, seed=1).roc_auc([], [])
 
-    assert all(_is_missing(v) for v in (lower, point, upper))
+    assert (lower, point, upper) == (None, None, None)
 
 
 def test_bootstrap_survives_degenerate_resamples():
-    """The reason NaN beats raising: one unlucky resample must not kill the run.
+    """The reason absent beats raising: one unlucky resample must not kill the run.
 
-    A tiny single-class input makes most resamples degenerate. The bootstrap should come
-    back with NaN where it could not compute, not propagate an exception.
+    A tiny single-class-heavy input makes many resamples degenerate. The bootstrap should
+    come back with a number from the resamples that did work.
     """
-    y_true = np.array([True, True, True, False])
-    y_score = np.array([0.9, 0.8, 0.7, 0.1])
+    y_true = [True, True, True, False]
+    y_score = [0.9, 0.8, 0.7, 0.1]
 
     lower, point, upper = rs.Bootstrap(iterations=50, seed=1).roc_auc(y_true, y_score)
 
@@ -105,6 +138,54 @@ def test_bootstrap_survives_degenerate_resamples():
     ],
 )
 def test_empty_bootstrap_of_regression_metrics(name, call):
-    lower, point, upper = call()
+    assert call() == (None, None, None), name
 
-    assert all(_is_missing(v) for v in (lower, point, upper)), f"{name}"
+
+def test_empty_bootstrap_confusion_matrix_separates_the_two():
+    """Both answers in one tuple, which is the clearest statement of the rule.
+
+    The point estimate is the confusion matrix of no rows: its counts are zero and its
+    `tpr` is 0/0, undefined, NaN -- exactly what the scalar metric returns. The bounds are
+    a different question: every replicate was undefined too, so there was nothing to take
+    a percentile of, and that is absent rather than undefined.
+    """
+    cm = rs.Bootstrap(iterations=5, seed=1).confusion_matrix([], [])
+    lower, point, upper = cm.tpr
+
+    assert (lower, upper) == (None, None)
+    assert _is_nan(point)
+
+    assert cm.tp == (0.0, 0.0, 0.0)
+
+
+def test_run_skips_stat_func_iterations_that_return_none():
+    """`Bootstrap.run` takes an arbitrary `stat_func`, so it sees `None` too.
+
+    A user statistic reports "nothing to compute here" the same way the built-in metrics
+    do. Those iterations are skipped; the rest still make an interval.
+    """
+    df = pl.DataFrame({"x": [1.0, 2.0, 3.0, 4.0]})
+    calls = []
+
+    def stat_func(resample: pl.DataFrame):
+        calls.append(1)
+
+        return None if len(calls) % 2 == 0 else resample["x"].mean()
+
+    lower, point, upper = rs.Bootstrap(iterations=20, seed=1, n_jobs=1).run(
+        df, stat_func
+    )
+
+    assert lower is not None
+    assert upper is not None
+    assert lower <= point <= upper
+
+
+def test_run_with_no_usable_iterations_returns_null_bounds():
+    df = pl.DataFrame({"x": [1.0, 2.0, 3.0, 4.0]})
+
+    lower, point, upper = rs.Bootstrap(iterations=5, seed=1, n_jobs=1).run(
+        df, lambda _: None
+    )
+
+    assert (lower, point, upper) == (None, None, None)
