@@ -73,29 +73,64 @@ def test_run_uses_threads_when_n_jobs_is_not_one(data):
 
 
 @pytest.mark.parametrize(
-    "call",
+    ("call", "method"),
     [
         pytest.param(
             lambda bs, d: bs.confusion_matrix_at_thresholds(
                 d["y_true"], d["y_score"], strategy="cum_sum"
             ),
+            "percentile",
             id="confusion_matrix_at_thresholds",
         ),
         pytest.param(
             lambda bs, d: bs.adverse_impact_ratio_at_thresholds(
                 d["y_score"], d["protected"], ~d["protected"], strategy="cum_sum"
             ),
+            "percentile",
             id="adverse_impact_ratio_at_thresholds",
         ),
         pytest.param(
             lambda bs, d: bs.average_precision(d["y_true"], d["y_score"]),
+            "percentile",
             id="average_precision",
+        ),
+        # The BCa branches reach `_jacknife`, a second `_run_concurrent` call site inside
+        # the same method. The confusion-matrix one passed no executor kwargs at all, so
+        # `n_jobs` stopped at the resampling loop and the jackknife still fanned out.
+        # Explicit thresholds keep the jackknife frame small.
+        pytest.param(
+            lambda bs, d: bs.confusion_matrix_at_thresholds(
+                d["y_true"], d["y_score"], thresholds=[0.4, 0.6], strategy="cum_sum"
+            ),
+            "BCa",
+            id="confusion_matrix_at_thresholds-BCa",
+        ),
+        pytest.param(
+            lambda bs, d: bs.adverse_impact_ratio_at_thresholds(
+                d["y_score"],
+                d["protected"],
+                ~d["protected"],
+                thresholds=[0.4, 0.6],
+                strategy="cum_sum",
+            ),
+            "BCa",
+            id="adverse_impact_ratio_at_thresholds-BCa",
         ),
     ],
 )
-def test_cum_sum_paths_accept_n_jobs(data, call):
+@pytest.mark.parametrize("sampling_method", ["multinomial", "poisson"])
+def test_cum_sum_paths_accept_n_jobs(data, call, method, sampling_method):
     """These route through `_run_concurrent` too, and must honour the setting."""
-    result = call(rs.Bootstrap(iterations=8, seed=SEED, n_jobs=1), data)
+    result = call(
+        rs.Bootstrap(
+            iterations=8,
+            seed=SEED,
+            n_jobs=1,
+            method=method,
+            sampling_method=sampling_method,
+        ),
+        data,
+    )
 
     assert result is not None
 
@@ -118,6 +153,28 @@ def test_quiet_suppresses_progress_bars(data, capsys):
 
     rs.Bootstrap(iterations=8, seed=SEED, n_jobs=1, quiet=True).run(
         frame, lambda df: float(df["y"].mean())
+    )
+
+    assert capsys.readouterr().err == "", "progress output leaked despite quiet=True"
+
+
+@pytest.mark.parametrize("sampling_method", ["multinomial", "poisson"])
+def test_quiet_suppresses_the_bca_jackknife_bar(data, capsys, sampling_method):
+    """The cum_sum BCa jackknife is a `_run_concurrent` call of its own.
+
+    `_jacknife` defaults `quiet` to True, so the confusion-matrix site passing no
+    executor kwargs was silent by accident rather than by request -- and `n_jobs` was
+    dropped on the same line. Asserting on both together keeps them from drifting apart.
+    """
+    rs.Bootstrap(
+        iterations=8,
+        seed=SEED,
+        n_jobs=1,
+        quiet=True,
+        method="BCa",
+        sampling_method=sampling_method,
+    ).confusion_matrix_at_thresholds(
+        data["y_true"], data["y_score"], thresholds=[0.4, 0.6], strategy="cum_sum"
     )
 
     assert capsys.readouterr().err == "", "progress output leaked despite quiet=True"

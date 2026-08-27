@@ -888,9 +888,13 @@ class Bootstrap:
                     .unpivot(index="threshold")
                     .rename({"variable": "metric", "value": "original_value"})
                 )
-                jacknife_lf = pl.concat(_jacknife(df, _cm_inner), how="vertical").pipe(
-                    _process_results
-                )
+                # `df` is a LazyFrame on the poisson path, but the jackknife indexes
+                # rows and needs a height.
+                jacknife_df = df.pipe(_collect) if isinstance(df, pl.LazyFrame) else df
+                jacknife_lf = pl.concat(
+                    _jacknife(jacknife_df, _cm_inner, **self._concurrent_kwargs),
+                    how="vertical",
+                ).pipe(_process_results)
 
                 return (
                     _bca_interval_polars(

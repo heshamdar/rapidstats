@@ -67,9 +67,29 @@ def test_polars_dynamic_quantile_in_agg_works():
     assert result["q"].null_count() == 0
 
 
-def test_bca_confusion_matrix_at_thresholds(data):
+# `sampling_method` and `resample_mode` are orthogonal to `method` and `strategy`, and
+# every combination is meant to be valid. Testing one axis at a time is what let the
+# poisson BCa crash ship: `df` is a LazyFrame on that path, and the jackknife indexes
+# rows. `test_resample_mode.py` already gives `roc_auc` this grid.
+MODES = pytest.mark.parametrize(
+    ("sampling_method", "resample_mode"),
+    [
+        ("multinomial", "weights"),
+        ("multinomial", "materialize"),
+        ("poisson", "weights"),
+        ("poisson", "materialize"),
+    ],
+)
+
+
+@MODES
+def test_bca_confusion_matrix_at_thresholds(data, sampling_method, resample_mode):
     result = rs.Bootstrap(
-        iterations=100, seed=SEED, method="BCa"
+        iterations=100,
+        seed=SEED,
+        method="BCa",
+        sampling_method=sampling_method,
+        resample_mode=resample_mode,
     ).confusion_matrix_at_thresholds(
         data["y_true"], data["y_score"], thresholds=THRESHOLDS, strategy="cum_sum"
     )
@@ -84,9 +104,14 @@ def test_bca_confusion_matrix_at_thresholds(data):
     assert (ordered["point"] <= ordered["upper"]).all()
 
 
-def test_bca_adverse_impact_ratio_at_thresholds(data):
+@MODES
+def test_bca_adverse_impact_ratio_at_thresholds(data, sampling_method, resample_mode):
     result = rs.Bootstrap(
-        iterations=100, seed=SEED, method="BCa"
+        iterations=100,
+        seed=SEED,
+        method="BCa",
+        sampling_method=sampling_method,
+        resample_mode=resample_mode,
     ).adverse_impact_ratio_at_thresholds(
         data["y_score"],
         data["protected"],
