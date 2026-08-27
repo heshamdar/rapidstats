@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextvars
 import multiprocessing
 from typing import Literal, Optional, Union
 
@@ -97,6 +98,28 @@ def _expr_fill_infinite(
     return pl.when(expr.is_infinite()).then(value).otherwise(expr)
 
 
+def _in_context(context: contextvars.Context, fn, i):
+    """Run `fn(i)` inside `context`. Module level so it stays picklable."""
+    return context.run(fn, i)
+
+
+def _context_per_task(fn, items: list) -> list:
+    """One `(context, fn, item)` triple per task, contexts copied on the calling thread.
+
+    `ThreadPoolExecutor` does not propagate the caller's context to its workers, so a
+    `ContextVar` set by the caller -- `rapidstats.Config.engine(...)` -- would not be
+    visible to work submitted there. `Bootstrap.run` cares: its user-supplied `stat_func`
+    runs on those threads and may call any metric in the library.
+
+    A copy per task rather than one shared copy, because a `Context` cannot be entered by
+    two threads at once -- sharing one raises `RuntimeError: cannot enter context ... is
+    already entered` as soon as the pool has more than one worker. And copied here rather
+    than inside the worker, which would snapshot the worker's context instead of the
+    caller's.
+    """
+    return [(contextvars.copy_context(), fn, item) for item in items]
+
+
 def _run_concurrent(
     fn,
     iterable,
@@ -112,6 +135,19 @@ def _run_concurrent(
     if executor_kwargs.get("max_workers") == 1:
         return [fn(i) for i in tqdm(iterable, disable=quiet)]
 
+    # Every task as a `(callable, *args)` pair, so the two dispatch branches below stay
+    # identical whether or not a context is being carried.
+    if executor == "threads":
+        call, args = _in_context, _context_per_task(fn, list(iterable))
+    else:
+        # No context carried for processes, or for a caller-supplied executor instance:
+        # a context cannot cross a process boundary, and a spawned worker re-imports the
+        # package and sees the defaults -- as it did before contextvars.
+        call, args = fn, [(item,) for item in iterable]
+
+    if not args:
+        return []
+
     if executor == "threads":
         executor = concurrent.futures.ThreadPoolExecutor(**executor_kwargs)
     elif executor == "processes":
@@ -121,12 +157,12 @@ def _run_concurrent(
 
     if preserve_order:
         with executor as pool:
-            res = pool.map(fn, iterable)
+            res = pool.map(call, *zip(*args))
 
         return list(res)
 
     with executor as pool:
-        futures = [pool.submit(fn, i) for i in iterable]
+        futures = [pool.submit(call, *a) for a in args]
         res = []
         for future in concurrent.futures.as_completed(futures):
             res.append(future.result())
@@ -134,13 +170,21 @@ def _run_concurrent(
     return res
 
 
-def _collect(lf: pl.LazyFrame, **kwargs):
+def _collect(lf, **kwargs):
     """Collect through the configured engine.
 
     Every `.collect()` in the library goes through here so the engine is one decision in
     one place rather than 24 implicit ones. See `rapidstats.Config.set_engine`.
+
+    Only polars takes an engine. `selection.py` pipes *narwhals* frames through here, and
+    `narwhals.stable.v1.LazyFrame.collect` was `collect(self)` until ~1.30 -- so on the
+    floor this project declares, forwarding `engine=` raises `TypeError`. An engine is
+    meaningless for a non-polars backend anyway, so it is not forwarded there.
     """
     from ._config import Config
+
+    if not isinstance(lf, pl.LazyFrame):
+        return lf.collect(**kwargs)
 
     return lf.collect(engine=Config.get_engine(), **kwargs)
 

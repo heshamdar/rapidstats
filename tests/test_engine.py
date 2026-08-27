@@ -250,3 +250,112 @@ def test_no_bare_collect_calls_remain():
         "these bypass the configured engine; use `.pipe(_collect)`:\n  "
         + "\n  ".join(offenders)
     )
+
+
+# ---------------------------------------------------------------------------------
+# Scope
+# ---------------------------------------------------------------------------------
+#
+# `Config` held a module-level global, so `Config.engine(...)` was process-wide: in a
+# library whose own default execution model is `_run_concurrent(..., executor="threads")`,
+# one thread's `with` block was visible to every other, and two threads entering it with
+# different engines restored each other's values on exit.
+#
+# The fix is a `ContextVar` -- but a bare swap trades one bug for another, because
+# `ThreadPoolExecutor` does not propagate the caller's context to its workers. Both
+# properties are asserted, because getting either alone is wrong.
+
+
+def test_engine_context_does_not_leak_across_threads():
+    """One thread's `with` block must not be visible to another."""
+    import threading
+
+    entered = threading.Event()
+    observed: list[str] = []
+    release = threading.Event()
+
+    def setter():
+        with rs.Config.engine("streaming"):
+            entered.set()
+            release.wait(timeout=5)
+
+    thread = threading.Thread(target=setter)
+    thread.start()
+    try:
+        assert entered.wait(timeout=5), "setter thread never entered the block"
+        observed.append(rs.Config.get_engine())
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert observed == ["in-memory"], (
+        f"the main thread saw {observed[0]!r} while another thread was inside "
+        f"`Config.engine('streaming')`; the setting is not thread-scoped"
+    )
+    assert rs.Config.get_engine() == "in-memory"
+
+
+def test_library_fan_out_sees_a_caller_set_engine():
+    """A caller-set engine must still reach the library's own worker threads.
+
+    `Bootstrap.run` executes `stat_func` on a `ThreadPoolExecutor`, and that function may
+    call any metric in the library -- so it has to observe the engine the caller chose.
+    `ThreadPoolExecutor` does not propagate context on its own; `_run_concurrent` copies
+    it. Without that copy this test fails while the isolation test above still passes.
+    """
+    import threading
+
+    frame = pl.DataFrame({"y": np.arange(64, dtype=float)})
+    seen: set[str] = set()
+    lock = threading.Lock()
+
+    def stat_func(df: pl.DataFrame) -> float:
+        with lock:
+            seen.add(rs.Config.get_engine())
+
+        return float(df["y"].mean())
+
+    with rs.Config.engine("streaming"):
+        rs.Bootstrap(iterations=8, seed=SEED, n_jobs=4).run(frame, stat_func)
+
+    assert seen == {"streaming"}, (
+        f"worker threads saw {sorted(seen)} while the caller was inside "
+        f"`Config.engine('streaming')`; the context is not reaching the fan-out"
+    )
+
+
+def test_collect_does_not_forward_an_engine_to_narwhals():
+    """`selection.py` pipes narwhals frames through `_collect`.
+
+    `narwhals.stable.v1.LazyFrame.collect` was `collect(self)` until ~1.30, so forwarding
+    `engine=` raised `TypeError` on the floor this project declared. An engine is
+    meaningless for a non-polars backend regardless.
+    """
+    import narwhals.stable.v1 as nw
+
+    from rapidstats._utils import _collect
+
+    lf = nw.from_native(pl.LazyFrame({"a": [1, 2, 3]}))
+
+    with rs.Config.engine("streaming"):
+        result = _collect(lf)
+
+    assert result.shape == (3, 1)
+
+
+def test_collect_still_forwards_an_engine_to_polars():
+    """The guard above must not disable engine selection for polars frames."""
+    from rapidstats._utils import _collect
+
+    seen: list[str] = []
+
+    class _Spy(pl.LazyFrame):
+        def collect(self, **kwargs):
+            seen.append(kwargs.get("engine"))
+
+            return pl.DataFrame({"a": [1]})
+
+    with rs.Config.engine("streaming"):
+        _collect(_Spy())
+
+    assert seen == ["streaming"]

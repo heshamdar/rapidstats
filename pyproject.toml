@@ -16,7 +16,9 @@ dependencies = [
     # `join_nulls`) and `join_asof` semantics are relied on directly rather than
     # version-sniffed.
     "polars>=1.33,<2.0",
-    "narwhals>=1.0.0",
+    # `_utils._collect` guards the engine kwarg, but `selection.py` still needs a
+    # narwhals whose lazy API this code is written against.
+    "narwhals>=1.30.0",
     "tqdm",
 ]
 

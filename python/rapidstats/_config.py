@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 from typing import Iterator, Literal
 
 Engine = Literal["in-memory", "streaming"]
@@ -31,7 +32,19 @@ _VALID_ENGINES: tuple[Engine, ...] = ("in-memory", "streaming")
 # flips its own.
 _DEFAULT_ENGINE: Engine = "in-memory"
 
-_engine: Engine = _DEFAULT_ENGINE
+# A `ContextVar` rather than a module global, so `Config.engine(...)` scopes to the
+# caller instead of the process. The library's own default execution model is
+# `_run_concurrent(..., executor="threads")`, so a process-wide setting meant one thread's
+# `with` block was visible to every other, and two threads entering it with different
+# engines restored each other's values on exit.
+#
+# `_run_concurrent` copies the caller's context into its workers, so a caller-set engine
+# still reaches the library's fan-out. Processes cannot inherit a context; a spawned
+# worker re-imports this module and sees `_DEFAULT_ENGINE`, which is what it did before
+# this change too.
+_engine: contextvars.ContextVar[Engine] = contextvars.ContextVar(
+    "rapidstats_engine", default=_DEFAULT_ENGINE
+)
 
 
 class Config:
@@ -60,7 +73,7 @@ class Config:
         Engine
             Either `"in-memory"` or `"streaming"`
         """
-        return _engine
+        return _engine.get()
 
     @staticmethod
     def set_engine(engine: Engine) -> None:
@@ -78,15 +91,13 @@ class Config:
         ValueError
             If `engine` is not a supported value
         """
-        global _engine
-
         if engine not in _VALID_ENGINES:
             raise ValueError(
                 f"Invalid engine `{engine}`, only "
                 f"{' and '.join(repr(e) for e in _VALID_ENGINES)} are supported"
             )
 
-        _engine = engine
+        _engine.set(engine)
 
     @staticmethod
     @contextlib.contextmanager
@@ -98,9 +109,16 @@ class Config:
         engine : Engine
             Either `"in-memory"` or `"streaming"`
         """
-        previous = Config.get_engine()
-        Config.set_engine(engine)
+        if engine not in _VALID_ENGINES:
+            raise ValueError(
+                f"Invalid engine `{engine}`, only "
+                f"{' and '.join(repr(e) for e in _VALID_ENGINES)} are supported"
+            )
+
+        # A token rather than saving and restoring the value, so nesting unwinds
+        # correctly even if an inner block sets the engine without a context manager.
+        token = _engine.set(engine)
         try:
             yield
         finally:
-            Config.set_engine(previous)
+            _engine.reset(token)

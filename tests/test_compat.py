@@ -98,6 +98,44 @@ def test_declared_dependency_bounds_polars():
     )
 
 
+def test_declared_narwhals_floor_supports_the_lazy_api_used():
+    """`selection.py` builds narwhals LazyFrames; the declared floor must run them.
+
+    `narwhals.stable.v1.LazyFrame.collect` was `collect(self)` until ~1.30 -- verified
+    against 1.20.0, where `collect(engine=...)` raises `TypeError`. `_utils._collect`
+    no longer forwards an engine to a non-polars frame, but `selection.py` still needs a
+    narwhals whose lazy API this code is written against, so the floor has to say so.
+    """
+    requires = importlib.metadata.requires("rapidstats") or []
+    narwhals_reqs = [
+        r
+        for r in requires
+        if re.match(r"^\s*narwhals\b(?!-)", r) and "extra ==" not in r
+    ]
+
+    assert narwhals_reqs, "rapidstats does not declare a narwhals dependency"
+
+    floors = [
+        _version_tuple(m.group(1))
+        for r in narwhals_reqs
+        if (m := re.search(r">=\s*([0-9]+(?:\.[0-9]+)*)", r))
+    ]
+
+    assert floors and max(floors) >= (1, 30), (
+        f"declared narwhals floor {narwhals_reqs} is below 1.30, where "
+        f"`LazyFrame.collect` gained keyword arguments"
+    )
+
+
+def test_collect_accepts_a_narwhals_frame():
+    """The guard itself, not just the declared bound."""
+    import narwhals.stable.v1 as nw
+
+    from rapidstats._utils import _collect
+
+    assert _collect(nw.from_native(pl.LazyFrame({"a": [1, 2]}))).shape == (2, 1)
+
+
 def test_no_deprecation_warnings_from_rapidstats_code():
     """No polars API we call may be deprecated.
 
