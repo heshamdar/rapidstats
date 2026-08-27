@@ -67,6 +67,43 @@ ConfidenceInterval = tuple[Optional[float], Optional[float], Optional[float]]
 # are skipped rather than taking the run down.
 StatFunc = Callable[[pl.DataFrame], Optional[float]]
 
+# The `cum_sum` BCa jackknife builds one full threshold curve per row and concatenates
+# them, so the frame is `height` x `len(thresholds)` x `len(metrics)` cells. Measured on
+# this branch at 20 iterations with default thresholds:
+#
+#         n     wall     peak RSS
+#       200    0.9 s      0.45 GB
+#       400    2.0 s      0.89 GB
+#       800    4.9 s      2.10 GB
+#     1,600   24.8 s      6.33 GB
+#
+# Growth per doubling rises 2.1x -> 2.5x -> 5.0x, so a realistic n = 10,000 exhausts
+# memory rather than finishing -- and when `thresholds` is None the target set is itself
+# n wide, which is the shape that blows up. `src/metrics.rs::jacknife_confusion_matrix`
+# solves this in closed form, but only for the scalar Rust path; until that is extended
+# here, refuse above roughly the n=800 row. A refusal a caller can act on beats an OOM
+# with no traceback.
+_BCA_CUMSUM_MAX_CELLS = 20_000_000
+
+
+def _guard_bca_cumsum_size(height: int, n_thresholds: int, n_metrics: int = 1) -> None:
+    """Refuse a jackknife whose frame would not fit, before building any of it."""
+    projected = height * n_thresholds * n_metrics
+
+    if projected <= _BCA_CUMSUM_MAX_CELLS:
+        return
+
+    shape = f"{height:,} rows x {n_thresholds:,} thresholds"
+    if n_metrics > 1:
+        shape += f" x {n_metrics:,} metrics"
+
+    raise ValueError(
+        f"BCa on the `cum_sum` strategy materialises a jackknife frame of {shape} = "
+        f"{projected:,} cells, above the {_BCA_CUMSUM_MAX_CELLS:,} limit. Pass a shorter "
+        f"explicit `thresholds` list, use `method='percentile'`, or use "
+        f"`strategy='loop'`."
+    )
+
 
 @dataclasses.dataclass
 class BootstrappedConfusionMatrix:
@@ -750,11 +787,23 @@ class Bootstrap:
             !!! Version
                 Added 0.2.0
 
+        !!! Warning
+            `method="BCa"` on `strategy="cum_sum"` builds a jackknife frame of one full
+            threshold curve per row -- `len(y_true)` x `len(thresholds)` x
+            `len(metrics)` cells -- and raises `ValueError` above a fixed limit rather
+            than exhausting memory. Pass a short explicit `thresholds` list, or use
+            `method="percentile"`.
+
         Returns
         -------
         pl.DataFrame
             A DataFrame of `threshold`, `metric`, `lower`, `mean`, and `upper`
 
+        Raises
+        ------
+        ValueError
+            If `method="BCa"` and `strategy="cum_sum"` on an input large enough that the
+            jackknife frame would not fit
 
         Added in version 0.1.0
         ----------------------
@@ -789,6 +838,12 @@ class Bootstrap:
         elif strategy == "cum_sum":
             if thresholds is None:
                 thresholds = df["threshold"].unique()
+
+            if self.method == "BCa":
+                # Before the resampling loop, not beside the jackknife it protects: the
+                # iterations are wasted work if the jackknife is going to be refused, and
+                # `df` is still eager here (the poisson branch below makes it lazy).
+                _guard_bca_cumsum_size(df.height, len(thresholds), len(tuple(metrics)))
 
             if self._params["poisson"]:
                 _matrix_func = _base_confusion_matrix_at_thresholds_sorted
@@ -1220,10 +1275,22 @@ class Bootstrap:
         strategy : LoopStrategy, optional
             Computation method, by default "auto"
 
+        !!! Warning
+            `method="BCa"` on `strategy="cum_sum"` builds a jackknife frame of one full
+            AIR curve per row -- `len(y_score)` x `len(thresholds)` cells -- and raises
+            `ValueError` above a fixed limit rather than exhausting memory. Pass a short
+            explicit `thresholds` list, or use `method="percentile"`.
+
         Returns
         -------
         pl.DataFrame
             A DataFrame of `threshold`, `lower`, `mean`, and `upper`
+
+        Raises
+        ------
+        ValueError
+            If `method="BCa"` and `strategy="cum_sum"` on an input large enough that the
+            jackknife frame would not fit
 
         """
         has_sample_weight = sample_weight is not None
@@ -1263,6 +1330,11 @@ class Bootstrap:
                 # join below. `confusion_matrix_at_thresholds` and the non-bootstrap AIR
                 # already deduplicate; this one did not.
                 thresholds = df["y_score"].unique()
+
+            if self.method == "BCa":
+                # See the equivalent guard in `confusion_matrix_at_thresholds`. One value
+                # per threshold here, rather than one per metric.
+                _guard_bca_cumsum_size(df.height, len(thresholds))
 
             if self._params["poisson"]:
                 _air_func = _air_at_thresholds_core_sorted
