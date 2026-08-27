@@ -4,14 +4,20 @@ import dataclasses
 import functools
 import math
 from collections.abc import Iterable
-from typing import Callable, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import polars as pl
-from polars.lazyframe.group_by import LazyGroupBy
-from polars.series.series import ArrayLike
 from tqdm.auto import tqdm
 
-from ._distributions import Random, norm
+from ._typing import ArrayLike
+
+if TYPE_CHECKING:
+    # Private path, and only ever used as an annotation. `from __future__ import
+    # annotations` above means it is never resolved at runtime, so keep it out of the
+    # import graph rather than depending on polars internals.
+    from polars.lazyframe.group_by import LazyGroupBy
+
+from ._distributions import Random, _pl_norm_cdf, _pl_norm_ppf, norm
 from ._rustystats import (
     _basic_interval,
     _bca_interval,
@@ -29,9 +35,11 @@ from ._rustystats import (
     _standard_interval,
 )
 from ._utils import (
+    _collect,
     _expr_fill_infinite,
     _fill_infinite,
     _regression_to_df,
+    _resolve_thresholds,
     _run_concurrent,
     _y_true_y_pred_to_df,
     _y_true_y_score_to_df,
@@ -52,8 +60,50 @@ from .metrics import (
 )
 from .metrics import average_precision as _ap
 
-ConfidenceInterval = tuple[float, float, float]
-StatFunc = Callable[[pl.DataFrame], float]
+# `(lower, point, upper)`. A bound is `None` when there was nothing to compute it from --
+# no usable replicate survived -- and NaN only when the arithmetic itself is undefined on
+# real data (`tpr` with no positives, `roc_auc` on a single class).
+ConfidenceInterval = tuple[Optional[float], Optional[float], Optional[float]]
+# `None` is allowed and means the resample had nothing to compute from; such iterations
+# are skipped rather than taking the run down.
+StatFunc = Callable[[pl.DataFrame], Optional[float]]
+
+# The `cum_sum` BCa jackknife builds one full threshold curve per row and concatenates
+# them, so the frame is `height` x `len(thresholds)` x `len(metrics)` cells. Measured on
+# this branch at 20 iterations with default thresholds:
+#
+#         n     wall     peak RSS
+#       200    0.9 s      0.45 GB
+#       400    2.0 s      0.89 GB
+#       800    4.9 s      2.10 GB
+#     1,600   24.8 s      6.33 GB
+#
+# Growth per doubling rises 2.1x -> 2.5x -> 5.0x, so a realistic n = 10,000 exhausts
+# memory rather than finishing -- and when `thresholds` is None the target set is itself
+# n wide, which is the shape that blows up. `src/metrics.rs::jacknife_confusion_matrix`
+# solves this in closed form, but only for the scalar Rust path; until that is extended
+# here, refuse above roughly the n=800 row. A refusal a caller can act on beats an OOM
+# with no traceback.
+_BCA_CUMSUM_MAX_CELLS = 20_000_000
+
+
+def _guard_bca_cumsum_size(height: int, n_thresholds: int, n_metrics: int = 1) -> None:
+    """Refuse a jackknife whose frame would not fit, before building any of it."""
+    projected = height * n_thresholds * n_metrics
+
+    if projected <= _BCA_CUMSUM_MAX_CELLS:
+        return
+
+    shape = f"{height:,} rows x {n_thresholds:,} thresholds"
+    if n_metrics > 1:
+        shape += f" x {n_metrics:,} metrics"
+
+    raise ValueError(
+        f"BCa on the `cum_sum` strategy materialises a jackknife frame of {shape} = "
+        f"{projected:,} cells, above the {_BCA_CUMSUM_MAX_CELLS:,} limit. Pass a shorter "
+        f"explicit `thresholds` list, use `method='percentile'`, or use "
+        f"`strategy='loop'`."
+    )
 
 
 @dataclasses.dataclass
@@ -125,6 +175,16 @@ class BootstrappedConfusionMatrix:
         )
 
 
+def _usable(stats: Iterable) -> list[float]:
+    """The replicates an interval can be computed from.
+
+    Drops the absent ones -- a `stat_func` that found no rows to read returns `None` --
+    and the undefined ones, whose NaN cannot be ordered and so would make every
+    percentile of the vector NaN.
+    """
+    return [x for x in stats if x is not None and not math.isnan(x)]
+
+
 def _bs_func(i: int, df: pl.DataFrame, stat_func):
     return stat_func(df.sample(fraction=1, with_replacement=True, seed=i))
 
@@ -133,34 +193,45 @@ def _js_func(i: int, df: pl.DataFrame, index: pl.Series, stat_func):
     return stat_func(df.filter(index.ne(i)))
 
 
-def _jacknife(df: pl.DataFrame, stat_func) -> list:
+def _jacknife(df: pl.DataFrame, stat_func, **executor_kwargs) -> list:
     df_height = df.height
     index = pl.Series("index", [i for i in range(df_height)])
     func = functools.partial(_js_func, df=df, index=index, stat_func=stat_func)
+    executor_kwargs.setdefault("quiet", True)
 
-    return _run_concurrent(func, range(df_height), quiet=True)
+    return _run_concurrent(func, range(df_height), **executor_kwargs)
 
 
 def _standard_interval_polars(lf: LazyGroupBy, alpha: float) -> pl.LazyFrame:
+    """Half-width `z * sigma_hat` per group.
+
+    Only the half-width, because the interval is centred on the point estimate and that
+    is not available until this is joined against the original statistics -- see
+    `_centre_standard_interval_on_point`. It previously centred on the bootstrap mean
+    while reporting the point estimate as the point, which put the reported point
+    off-centre in its own interval on any skewed bootstrap distribution.
+    """
     z = norm.ppf(1 - alpha)
 
-    return (
-        lf.agg(
-            pl.col("value").mean().alias("mean"),
-            pl.col("value").std().alias("std"),
-        )
-        .with_columns(pl.col("std").mul(z).alias("x"))
-        .with_columns(
-            pl.col("mean").sub(pl.col("x")).alias("lower"),
-            pl.col("mean").add(pl.col("x")).alias("upper"),
-        )
+    return lf.agg(pl.col("value").std().mul(z).alias("x"))
+
+
+def _centre_standard_interval_on_point(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Turn the half-width into bounds around `point`. Apply after joining `original`."""
+    return lf.with_columns(
+        pl.col("point").sub(pl.col("x")).alias("lower"),
+        pl.col("point").add(pl.col("x")).alias("upper"),
     )
 
 
 def _percentile_interval_polars(lf: LazyGroupBy, alpha: float) -> pl.LazyFrame:
+    # `interpolation="linear"` is not the polars default ("nearest"), but it is what
+    # Rust's `percentile` -- and numpy, and scipy -- mean by a percentile. Without it the
+    # scalar bootstraps and the cum_sum bootstraps reported bounds under two different
+    # definitions of the same quantity.
     return lf.agg(
-        pl.col("value").quantile(alpha).alias("lower"),
-        pl.col("value").quantile(1 - alpha).alias("upper"),
+        pl.col("value").quantile(alpha, interpolation="linear").alias("lower"),
+        pl.col("value").quantile(1 - alpha, interpolation="linear").alias("upper"),
     )
 
 
@@ -190,8 +261,12 @@ def _bca_interval_polars(
             .sum()
             .add(pl.col("value").le(pl.col("original_value")).sum())
             .truediv(pl.len().mul(2))
-            .map_elements(norm.ppf, return_dtype=pl.Float64)
             .alias("bias_correction_factor")
+        )
+        .with_columns(
+            _pl_norm_ppf(pl.col("bias_correction_factor")).alias(
+                "bias_correction_factor"
+            )
         )
     )
 
@@ -231,8 +306,7 @@ def _bca_interval_polars(
                 )
             )
         )
-        .map_elements(norm.cdf, return_dtype=pl.Float64)
-        .alias("lower_p"),
+        .alias("_lower_p_z"),
         pl.col("bias_correction_factor")
         .add(
             pl.col("bias_correction_factor")
@@ -245,16 +319,33 @@ def _bca_interval_polars(
                 )
             )
         )
-        .map_elements(norm.cdf, return_dtype=pl.Float64)
-        .alias("upper_p"),
+        .alias("_upper_p_z"),
+    )
+
+    p_lf = p_lf.with_columns(
+        _pl_norm_cdf(pl.col("_lower_p_z")).alias("lower_p"),
+        _pl_norm_cdf(pl.col("_upper_p_z")).alias("upper_p"),
     )
 
     return (
         bootstrap_lf.join(p_lf, on=by, how="left", validate="m:1")
         .group_by(by)
         .agg(
-            pl.col("value").quantile(pl.col("lower_p").first()).alias("lower"),
-            pl.col("value").quantile(pl.col("upper_p").first()).alias("upper"),
+            pl.col("value")
+            .quantile(pl.col("lower_p").first(), interpolation="linear")
+            .alias("lower"),
+            pl.col("value")
+            .quantile(pl.col("upper_p").first(), interpolation="linear")
+            .alias("upper"),
+        )
+        # Carry the point estimate through. Callers select `point` alongside the bounds,
+        # and this never produced one -- the code was unreachable behind a
+        # NotImplementedError, so the omission had never been exercised.
+        .join(
+            original_lf.rename({"original_value": "point"}),
+            on=by,
+            how="left",
+            validate="1:1",
         )
     )
 
@@ -262,16 +353,20 @@ def _bca_interval_polars(
 def _poisson_sample(
     pf: PolarsFrame, df_height: int, seed: Optional[int]
 ) -> PolarsFrame:
-    repeats = pl.Series("repeats", Random(seed).poisson(1, size=df_height))
-
-    return (
-        pf.with_row_index("index")
-        .with_columns(repeats)
-        .with_columns(pl.col("index").repeat_by("repeats"))
-        .explode("index")
-        .drop_nulls("index")
-        .drop("index", "repeats")
+    # Previously this built a row index, `repeat_by`'d it and `explode`d. That relied on
+    # `explode`'s `empty_as_null` default (rows drawn zero times became nulls, which a
+    # following `drop_nulls` removed) -- a default Polars 2.0 flips, and whose pinning
+    # kwarg does not exist before polars 1.41. Expanding the counts to gather indices in
+    # Rust sidesteps the question entirely, works on every supported polars, and is
+    # roughly 2x faster. The underlying draw is unchanged, so a given seed produces the
+    # same resample as before.
+    indices = pl.Series(
+        "index",
+        Random(seed).poisson_repeat_indices(1, size=df_height),
+        dtype=pl.UInt32,
     )
+
+    return pf.select(pl.all().gather(indices))
 
 
 def _multinomial_sample(df: pl.DataFrame, seed: Optional[int]) -> pl.DataFrame:
@@ -402,11 +497,28 @@ class Bootstrap:
         Whether to return the Percentile, Basic / Reverse Percentile, or
         Bias Corrected and Accelerated Interval, by default "percentile"
     sampling_method: Literal["poisson", "multinomial"], optional
-        How to sample. If "multinomial", sample with replacement. If "poisson", simulate
-        number of draws via a Poisson(1) distribution. Note that "poisson" is usually
-        much more performant, especially since order is preserved, which allows certain
-        functions to avoid sorting every iteration. However, "poisson" is still in a
-        beta stage, by default "multinomial"
+        How the resample multiplicities are *drawn*. If "multinomial", sample with
+        replacement. If "poisson", simulate the number of draws via a Poisson(1)
+        distribution, by default "multinomial"
+    resample_mode: Literal["weights", "materialize"], optional
+        How those multiplicities are *applied*, by default "weights"
+
+        Drawing row \\( i \\) exactly \\( c_i \\) times and computing a metric is
+        arithmetically identical to computing it once with `sample_weight` multiplied by
+        \\( c \\). "weights" uses that identity: the data is sorted once up front and
+        each iteration is a single weighted pass, instead of building and re-sorting a
+        fresh frame every time. It is exact, not an approximation, and measured 6-12x
+        faster.
+
+        "materialize" expands the multiplicities into a real resampled frame. Use it to
+        cross-check results, or for a statistic that is not weight-aware.
+
+        This is independent of `sampling_method`; all four combinations are valid. Note
+        that [rapidstats.Bootstrap.run][] always materializes, since an arbitrary
+        `stat_func` cannot be assumed to honour weights.
+
+        !!! Version
+            Added 0.5.0
     seed : Optional[int], optional
         Seed that controls resampling. Set this to any integer to make results
         reproducible, by default None
@@ -416,6 +528,14 @@ class Bootstrap:
     chunksize: Optional[int], optional
         The chunksize for each thread. None means let the executor decide, by default
         None
+
+        Applies to the Rust kernels, which chunk their rayon iterator. The Python-side
+        paths submit tasks individually and ignore it.
+    quiet: bool, optional
+        Suppress progress bars, by default False
+
+        !!! Version
+            Added 0.5.0
 
     Raises
     ------
@@ -439,9 +559,11 @@ class Bootstrap:
         confidence: float = 0.95,
         method: Literal["standard", "percentile", "basic", "BCa"] = "percentile",
         sampling_method: Literal["poisson", "multinomial"] = "multinomial",
+        resample_mode: Literal["weights", "materialize"] = "weights",
         seed: Optional[int] = None,
         n_jobs: Optional[int] = None,
         chunksize: Optional[int] = None,
+        quiet: bool = False,
     ) -> None:
         if method not in ("standard", "percentile", "basic", "BCa"):
             raise ValueError(
@@ -453,14 +575,21 @@ class Bootstrap:
                 f"Invalid sampling method `{sampling_method}`, only `poisson` and `multinomial` are supported"
             )
 
+        if resample_mode not in ("weights", "materialize"):
+            raise ValueError(
+                f"Invalid `resample_mode` `{resample_mode}`, only `weights` and `materialize` are supported"
+            )
+
         self.iterations = iterations
         self.confidence = confidence
         self.seed = seed
         self.alpha = (1 - confidence) / 2
         self.method = method
         self.sampling_method = sampling_method
+        self.resample_mode = resample_mode
         self.n_jobs = n_jobs
         self.chunksize = chunksize
+        self.quiet = quiet
 
         self._params = {
             "iterations": self.iterations,
@@ -470,7 +599,46 @@ class Bootstrap:
             "n_jobs": self.n_jobs,
             "chunksize": self.chunksize,
             "poisson": self.sampling_method == "poisson",
+            "weights": self.resample_mode == "weights",
         }
+
+    @property
+    def _concurrent_kwargs(self) -> dict:
+        """Executor settings for the Python-side paths.
+
+        `n_jobs` and `quiet` were previously stored, forwarded to the Rust kernels, and
+        then dropped on the floor here: `_run_concurrent` only serialises when it sees
+        `max_workers == 1`, so `n_jobs=1` left the Python paths running on a thread pool.
+
+        `chunksize` is deliberately absent. It is meaningful to the Rust bootstrap, which
+        chunks its rayon iterator, but `ThreadPoolExecutor` takes no such argument and
+        these paths submit tasks individually.
+        """
+        kwargs: dict = {"quiet": self.quiet}
+
+        if self.n_jobs is not None:
+            kwargs["max_workers"] = self.n_jobs
+
+        return kwargs
+
+    @property
+    def _params_unweighted(self) -> dict:
+        """`_params` with weight-based resampling forced off.
+
+        The weights identity only holds for a metric that actually honours
+        `sample_weight`. `max_ks` and `brier_loss` receive a weight column (every frame
+        built by `_y_true_y_score_to_df` has one) but their Rust kernels ignore it, so
+        scaling that column would leave the statistic unchanged -- every iteration would
+        return the same number and the interval would collapse to zero width.
+
+        Metrics whose frames have no `sample_weight` column at all (`mean`, and the
+        regression metrics via `_regression_to_df`) are caught by the equivalent guard
+        in `bootstrap::resample_fn`, so they do not need to route through here.
+
+        Remove a metric from this path once its kernel is weight-aware -- `max_ks` needs
+        a weighted ECDF.
+        """
+        return {**self._params, "weights": False}
 
     def run(
         self, df: pl.DataFrame, stat_func: StatFunc, **kwargs
@@ -484,7 +652,8 @@ class Bootstrap:
             The data to pass to `stat_func`
         stat_func : StatFunc
             A callable that takes a Polars DataFrame as its first argument and returns
-            a scalar real number.
+            a scalar real number, or `None` if this resample had nothing to compute
+            from. `None` and NaN iterations are both skipped.
 
         Returns
         -------
@@ -495,6 +664,7 @@ class Bootstrap:
         ----------------------
         """
         default = {"executor": "threads", "preserve_order": False}
+        default.update(self._concurrent_kwargs)
         for k, v in default.items():
             if k not in kwargs:
                 kwargs[k] = v
@@ -511,14 +681,14 @@ class Bootstrap:
         else:
             iterable = (self.seed + i for i in range(self.iterations))
 
-        bootstrap_stats = [
-            x for x in _run_concurrent(func, iterable, **kwargs) if not math.isnan(x)
-        ]
+        bootstrap_stats = _usable(_run_concurrent(func, iterable, **kwargs))
 
         original_stat = stat_func(df)
 
+        # Nothing usable to take an interval from: absent, so null rather than NaN. The
+        # point estimate is passed through as it came back -- it may itself be undefined.
         if len(bootstrap_stats) == 0:
-            return (math.nan, math.nan, math.nan)
+            return (None, original_stat, None)
 
         if self.method == "standard":
             return _standard_interval(original_stat, bootstrap_stats, self.alpha)
@@ -527,7 +697,9 @@ class Bootstrap:
         elif self.method == "basic":
             return _basic_interval(original_stat, bootstrap_stats, self.alpha)
         elif self.method == "BCa":
-            jacknife_stats = [x for x in _jacknife(df, stat_func) if not math.isnan(x)]
+            jacknife_stats = _usable(
+                _jacknife(df, stat_func, **self._concurrent_kwargs)
+            )
 
             return _bca_interval(
                 original_stat, bootstrap_stats, jacknife_stats, self.alpha
@@ -543,6 +715,8 @@ class Bootstrap:
         y_pred: ArrayLike,
         beta: float = 1.0,
         sample_weight: Optional[ArrayLike] = None,
+        *,
+        data=None,
     ) -> BootstrappedConfusionMatrix:
         r"""Bootstrap confusion matrix. See [rapidstats.metrics.confusion_matrix][] for
         more details.
@@ -570,9 +744,9 @@ class Bootstrap:
         Added in version 0.1.0
         ----------------------
         """
-        df = _y_true_y_pred_to_df(y_true, y_pred, sample_weight).with_columns(
-            pl.col("y_true").cast(pl.UInt8)
-        )
+        df = _y_true_y_pred_to_df(
+            y_true, y_pred, sample_weight, data=data
+        ).with_columns(pl.col("y_true").cast(pl.UInt8))
 
         return BootstrappedConfusionMatrix(
             *_bootstrap_confusion_matrix(df, beta, **self._params)
@@ -587,6 +761,8 @@ class Bootstrap:
         strategy: LoopStrategy = "auto",
         beta: float = 1.0,
         sample_weight: Optional[ArrayLike] = None,
+        *,
+        data=None,
     ) -> pl.DataFrame:
         r"""Bootstrap confusion matrix at thresholds. See
         [rapidstats.metrics.confusion_matrix_at_thresholds][] for more details.
@@ -612,6 +788,13 @@ class Bootstrap:
             !!! Version
                 Added 0.2.0
 
+        !!! Warning
+            `method="BCa"` on `strategy="cum_sum"` builds a jackknife frame of one full
+            threshold curve per row -- `len(y_true)` x `len(thresholds)` x
+            `len(metrics)` cells -- and raises `ValueError` above a fixed limit rather
+            than exhausting memory. Pass a short explicit `thresholds` list, or use
+            `method="percentile"`.
+
         Returns
         -------
         pl.DataFrame
@@ -619,14 +802,15 @@ class Bootstrap:
 
         Raises
         ------
-        NotImplementedError
-            When `strategy` is `cum_sum` and `method` is `BCa`
+        ValueError
+            If `method="BCa"` and `strategy="cum_sum"` on an input large enough that the
+            jackknife frame would not fit
 
         Added in version 0.1.0
         ----------------------
         """
         df = (
-            _y_true_y_score_to_df(y_true, y_score, sample_weight)
+            _y_true_y_score_to_df(y_true, y_score, sample_weight, data=data)
             .rename({"y_score": "threshold"})
             .sort("threshold", descending=True)
         )
@@ -636,7 +820,9 @@ class Bootstrap:
 
         if strategy == "loop":
             cms: list[pl.DataFrame] = []
-            for t in tqdm(set(thresholds or y_score)):
+            for t in tqdm(
+                _resolve_thresholds(thresholds, df, "threshold"), disable=self.quiet
+            ):
                 cm = (
                     self.confusion_matrix(
                         df["y_true"],
@@ -655,6 +841,12 @@ class Bootstrap:
         elif strategy == "cum_sum":
             if thresholds is None:
                 thresholds = df["threshold"].unique()
+
+            if self.method == "BCa":
+                # Before the resampling loop, not beside the jackknife it protects: the
+                # iterations are wasted work if the jackknife is going to be refused, and
+                # `df` is still eager here (the poisson branch below makes it lazy).
+                _guard_bca_cumsum_size(df.height, len(thresholds), len(tuple(metrics)))
 
             if self._params["poisson"]:
                 _matrix_func = _base_confusion_matrix_at_thresholds_sorted
@@ -686,6 +878,7 @@ class Bootstrap:
                     if self.seed is not None
                     else (None for _ in range(self.iterations))
                 ),
+                **self._concurrent_kwargs,
             )
 
             def _process_results(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -716,8 +909,9 @@ class Bootstrap:
                         how="left",
                         validate="1:1",
                     )
+                    .pipe(_centre_standard_interval_on_point)
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "percentile":
                 return (
@@ -729,7 +923,7 @@ class Bootstrap:
                         validate="1:1",
                     )
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "basic":
                 return (
@@ -742,12 +936,9 @@ class Bootstrap:
                     )
                     .pipe(_basic_interval_polars)
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "BCa":
-                raise NotImplementedError(
-                    "Method `BCa` not implemented for strategy `cum_sum` due to https://github.com/pola-rs/polars/issues/20951"
-                )
                 original_lf = (
                     _cm_inner(df)
                     .select("threshold", *metrics)
@@ -755,9 +946,13 @@ class Bootstrap:
                     .unpivot(index="threshold")
                     .rename({"variable": "metric", "value": "original_value"})
                 )
-                jacknife_lf = pl.concat(_jacknife(df, _cm_inner), how="vertical").pipe(
-                    _process_results
-                )
+                # `df` is a LazyFrame on the poisson path, but the jackknife indexes
+                # rows and needs a height.
+                jacknife_df = df.pipe(_collect) if isinstance(df, pl.LazyFrame) else df
+                jacknife_lf = pl.concat(
+                    _jacknife(jacknife_df, _cm_inner, **self._concurrent_kwargs),
+                    how="vertical",
+                ).pipe(_process_results)
 
                 return (
                     _bca_interval_polars(
@@ -768,7 +963,7 @@ class Bootstrap:
                         by=["threshold", "metric"],
                     )
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             else:
                 raise ValueError()
@@ -778,6 +973,8 @@ class Bootstrap:
         y_true: ArrayLike,
         y_score: ArrayLike,
         sample_weight: Optional[ArrayLike] = None,
+        *,
+        data=None,
     ) -> ConfidenceInterval:
         """Bootstrap ROC-AUC. See [rapidstats.metrics.roc_auc][] for more details.
 
@@ -803,11 +1000,19 @@ class Bootstrap:
         - Added in version 0.1.0
         - Returns point estimate instead of mean starting version 0.3.0
         """
-        df = _y_true_y_score_to_df(y_true, y_score, sample_weight).with_columns(
-            pl.col("y_true").cast(pl.Float64)
-        )
+        df = _y_true_y_score_to_df(
+            y_true, y_score, sample_weight, data=data
+        ).with_columns(pl.col("y_true").cast(pl.Float64))
 
-        if self._params["poisson"]:
+        # ROC-AUC needs its input sorted by score. Any resampling that preserves row
+        # order lets that sort happen once here rather than inside all `iterations`
+        # kernels. Weight-based resampling only rescales a column, so it qualifies for
+        # both sampling methods; materialised Poisson resampling qualifies because it
+        # gathers indices in ascending order. Only a materialised multinomial resample
+        # genuinely permutes rows, and it alone still pays the per-iteration sort.
+        order_preserved = self._params["weights"] or self._params["poisson"]
+
+        if order_preserved:
             df = df.sort("y_score")
             _f = _bootstrap_roc_auc_sorted
         else:
@@ -872,6 +1077,7 @@ class Bootstrap:
                 if self.seed is not None
                 else (None for _ in range(self.iterations))
             ),
+            **self._concurrent_kwargs,
         )
 
         cms = [
@@ -887,7 +1093,7 @@ class Bootstrap:
                     "average_precision"
                 )
             )
-            .collect()["average_precision"]
+            .pipe(_collect)["average_precision"]
             .to_list()
         )
 
@@ -907,7 +1113,9 @@ class Bootstrap:
                 return _cm_inner(j_df).with_columns(pl.lit(i).alias("iteration"))
 
             df = df.with_row_index("index")
-            cms = _run_concurrent(_cm_jacknife, range(df.height))
+            cms = _run_concurrent(
+                _cm_jacknife, range(df.height), **self._concurrent_kwargs
+            )
             jacknife_stats = (
                 pl.concat(cms, how="vertical")
                 .sort("threshold")
@@ -917,7 +1125,7 @@ class Bootstrap:
                         "average_precision"
                     )
                 )
-                .collect()["average_precision"]
+                .pipe(_collect)["average_precision"]
                 .to_list()
             )
 
@@ -925,7 +1133,9 @@ class Bootstrap:
                 original_stat, bootstrap_stats, jacknife_stats, self.alpha
             )
 
-    def max_ks(self, y_true: ArrayLike, y_score: ArrayLike) -> ConfidenceInterval:
+    def max_ks(
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
+    ) -> ConfidenceInterval:
         """Bootstrap Max-KS. See [rapidstats.metrics.max_ks][] for more details.
 
         Parameters
@@ -945,11 +1155,13 @@ class Bootstrap:
         - Added in version 0.1.0
         - Returns point estimate instead of mean starting version 0.3.0
         """
-        df = _y_true_y_score_to_df(y_true, y_score)
+        df = _y_true_y_score_to_df(y_true, y_score, data=data)
 
-        return _bootstrap_max_ks(df, **self._params)
+        return _bootstrap_max_ks(df, **self._params_unweighted)
 
-    def brier_loss(self, y_true: ArrayLike, y_score: ArrayLike) -> ConfidenceInterval:
+    def brier_loss(
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
+    ) -> ConfidenceInterval:
         """Bootstrap Brier loss. See [rapidstats.metrics.brier_loss][] for more details.
 
         Parameters
@@ -964,9 +1176,9 @@ class Bootstrap:
         ConfidenceInterval
             A tuple of (lower, point, upper)
         """
-        df = _y_true_y_score_to_df(y_true, y_score)
+        df = _y_true_y_score_to_df(y_true, y_score, data=data)
 
-        return _bootstrap_brier_loss(df, **self._params)
+        return _bootstrap_brier_loss(df, **self._params_unweighted)
 
     def mean(self, y: ArrayLike) -> ConfidenceInterval:
         """Bootstrap mean.
@@ -1066,6 +1278,12 @@ class Bootstrap:
         strategy : LoopStrategy, optional
             Computation method, by default "auto"
 
+        !!! Warning
+            `method="BCa"` on `strategy="cum_sum"` builds a jackknife frame of one full
+            AIR curve per row -- `len(y_score)` x `len(thresholds)` cells -- and raises
+            `ValueError` above a fixed limit rather than exhausting memory. Pass a short
+            explicit `thresholds` list, or use `method="percentile"`.
+
         Returns
         -------
         pl.DataFrame
@@ -1073,8 +1291,10 @@ class Bootstrap:
 
         Raises
         ------
-        NotImplementedError
-            When `strategy` is `cum_sum` and `method` is `BCa`
+        ValueError
+            If `method="BCa"` and `strategy="cum_sum"` on an input large enough that the
+            jackknife frame would not fit
+
         """
         has_sample_weight = sample_weight is not None
         df = pl.DataFrame(
@@ -1093,7 +1313,9 @@ class Bootstrap:
 
         if strategy == "loop":
             airs: list[dict[str, float]] = []
-            for t in tqdm(set(thresholds or y_score)):
+            for t in tqdm(
+                _resolve_thresholds(thresholds, df, "y_score"), disable=self.quiet
+            ):
                 lower, point, upper = self.adverse_impact_ratio(
                     df["y_score"].lt(t),
                     df["protected"],
@@ -1108,12 +1330,28 @@ class Bootstrap:
 
         elif strategy == "cum_sum":
             if thresholds is None:
-                thresholds = df["y_score"]
+                # `.unique()` matters: the raw column repeats whenever scores tie, and
+                # duplicated targets both waste work and break the 1:1 protected/control
+                # join below. `confusion_matrix_at_thresholds` and the non-bootstrap AIR
+                # already deduplicate; this one did not.
+                thresholds = df["y_score"].unique()
+
+            if self.method == "BCa":
+                # See the equivalent guard in `confusion_matrix_at_thresholds`. One value
+                # per threshold here, rather than one per metric.
+                _guard_bca_cumsum_size(df.height, len(thresholds))
 
             if self._params["poisson"]:
                 _air_func = _air_at_thresholds_core_sorted
                 _sample_func = functools.partial(_poisson_sample, df_height=df.height)
-                df = df.lazy()
+                # `_air_at_thresholds_core_sorted` reads row position as the rank of
+                # `y_score`, and `_poisson_sample` gathers indices in ascending order --
+                # so sorting once here holds for every iteration. Without it each
+                # resample was scanned unordered while the point estimate came from
+                # `_air_at_thresholds_core`, which sorts: same point, interval measured
+                # 6x to 29x too wide. `confusion_matrix_at_thresholds` sorts its frame
+                # at construction for exactly this reason.
+                df = df.sort("y_score").lazy()
             else:
                 _air_func = _air_at_thresholds_core
                 _sample_func = _multinomial_sample
@@ -1130,6 +1368,7 @@ class Bootstrap:
                     if self.seed is not None
                     else (None for _ in range(self.iterations))
                 ),
+                **self._concurrent_kwargs,
             )
             bootstrap_lf = (
                 pl.concat(airs, how="vertical")
@@ -1153,15 +1392,16 @@ class Bootstrap:
                 return (
                     _standard_interval_polars(lf, self.alpha)
                     .join(original, on="threshold", how="left", validate="1:1")
+                    .pipe(_centre_standard_interval_on_point)
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "percentile":
                 return (
                     _percentile_interval_polars(lf, self.alpha)
                     .join(original, on="threshold", how="left", validate="1:1")
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "basic":
                 return (
@@ -1169,12 +1409,9 @@ class Bootstrap:
                     .join(original, on="threshold", how="left", validate="1:1")
                     .pipe(_basic_interval_polars)
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
             elif self.method == "BCa":
-                raise NotImplementedError(
-                    "Method `BCa` not implemented for strategy `cum_sum` due to https://github.com/pola-rs/polars/issues/20951"
-                )
                 original_lf = (
                     _air_at_thresholds_core(df, thresholds, has_sample_weight)
                     .rename({"air": "original_value"})
@@ -1186,26 +1423,33 @@ class Bootstrap:
                     thresholds=thresholds,
                     has_sample_weight=has_sample_weight,
                 )
-                jacknife_lf = (
-                    pl.concat(_jacknife(df, tmp), how="vertical")
-                    .rename({"air": "value"})
-                    .unique("threshold")
-                )
+                # `df` is a LazyFrame on the poisson path, but the jackknife indexes
+                # rows and needs a height.
+                jacknife_df = df.pipe(_collect) if isinstance(df, pl.LazyFrame) else df
+                # No `.unique("threshold")` here. The acceleration factor is computed
+                # from the spread of the leave-one-out replicates, so collapsing to one
+                # row per threshold leaves zero variance -- a zero denominator, a NaN
+                # acceleration factor, and every interval null.
+                jacknife_lf = pl.concat(
+                    _jacknife(jacknife_df, tmp, **self._concurrent_kwargs),
+                    how="vertical",
+                ).rename({"air": "value"})
 
                 return (
                     _bca_interval_polars(
                         original_lf,
-                        bootstrap_lf=bootstrap_lf.rename({"air": "value"}),
+                        # Already renamed to `value` where `bootstrap_lf` was built.
+                        bootstrap_lf=bootstrap_lf,
                         jacknife_lf=jacknife_lf,
                         alpha=self.alpha,
                         by=["threshold"],
                     )
                     .select(final_cols)
-                    .collect()
+                    .pipe(_collect)
                 )
 
     def mean_squared_error(
-        self, y_true: ArrayLike, y_score: ArrayLike
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
     ) -> ConfidenceInterval:
         r"""Bootstrap MSE. See [rapidstats.metrics.mean_squared_error][] for more details.
 
@@ -1225,11 +1469,11 @@ class Bootstrap:
         ----------------------
         """
         return _bootstrap_mean_squared_error(
-            _regression_to_df(y_true, y_score), **self._params
+            _regression_to_df(y_true, y_score, data=data), **self._params
         )
 
     def root_mean_squared_error(
-        self, y_true: ArrayLike, y_score: ArrayLike
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
     ) -> ConfidenceInterval:
         r"""Bootstrap RMSE. See [rapidstats.metrics.root_mean_squared_error][] for more details.
 
@@ -1249,10 +1493,12 @@ class Bootstrap:
         ----------------------
         """
         return _bootstrap_root_mean_squared_error(
-            _regression_to_df(y_true, y_score), **self._params
+            _regression_to_df(y_true, y_score, data=data), **self._params
         )
 
-    def r2(self, y_true: ArrayLike, y_score: ArrayLike) -> ConfidenceInterval:
+    def r2(
+        self, y_true: ArrayLike, y_score: ArrayLike, *, data=None
+    ) -> ConfidenceInterval:
         """Bootstrap R2. See [rapidstats.metrics.r2][] for more details.
 
         Parameters
@@ -1270,4 +1516,6 @@ class Bootstrap:
         Added in version 0.1.0
         ----------------------
         """
-        return _bootstrap_r2(_regression_to_df(y_true, y_score), **self._params)
+        return _bootstrap_r2(
+            _regression_to_df(y_true, y_score, data=data), **self._params
+        )

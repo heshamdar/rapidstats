@@ -19,23 +19,37 @@ def _alpha(confidence_level: float) -> float:
     return (1 - confidence_level) / 2
 
 
-def reference_standard_interval(bootstrap_stats, confidence_level):
+def reference_standard_interval(point, bootstrap_stats, confidence_level):
+    r"""The first-order normal approximation: \hat{\theta} +/- z * \hat{\sigma}.
+
+    Centred on the observed statistic, which is what the class docstring specifies and
+    what is reported as the point estimate. The implementation used to centre on the
+    bootstrap *mean* instead, so on a skewed bootstrap distribution the reported point
+    sat off-centre in its own interval -- measured at 0.014 off for a bootstrapped
+    ROC-AUC. This reference moved with that fix.
+    """
     alpha = _alpha(confidence_level)
 
-    mean = np.mean(bootstrap_stats)
-    stdev = np.std(bootstrap_stats, ddof=1)
-    stderr = stdev
-    z = scipy.stats.norm.ppf(1 - alpha)
-    x = z * stderr
+    stderr = np.std(bootstrap_stats, ddof=1)
+    x = scipy.stats.norm.ppf(1 - alpha) * stderr
 
-    return (mean - x, mean + x)
+    return (point - x, point + x)
 
 
 def test_standard_interval():
     rs = rapidstats._bootstrap._standard_interval(POINT, BOOTSTRAP_STATS, ALPHA)
-    ref = reference_standard_interval(BOOTSTRAP_STATS, CONFIDENCE_LEVEL)
+    ref = reference_standard_interval(POINT, BOOTSTRAP_STATS, CONFIDENCE_LEVEL)
 
     assert pytest.approx((rs[0], rs[2])) == ref
+
+
+def test_standard_interval_is_symmetric_about_the_point():
+    lower, point, upper = rapidstats._bootstrap._standard_interval(
+        POINT, BOOTSTRAP_STATS, ALPHA
+    )
+
+    assert point == POINT
+    assert (lower + upper) / 2 == pytest.approx(POINT)
 
 
 def reference_percentile_interval(bootstrap_stats, confidence_level):
@@ -220,3 +234,45 @@ def test_bootstrap_succesfully_runs(method, sampling_method):
     bs.mean_squared_error(y_true_score, y_score)
     bs.root_mean_squared_error(y_true_score, y_score)
     bs.r2(y_true_score, y_score)
+
+
+@pytest.mark.parametrize("strategy", ["loop", "cum_sum"])
+def test_air_at_thresholds_with_tied_scores(strategy):
+    """Tied scores must not crash the bootstrap.
+
+    `Bootstrap.adverse_impact_ratio_at_thresholds` passed the raw `y_score` column as
+    the threshold list when `thresholds` was None, where the non-bootstrap version
+    deduplicates first. Duplicated targets then tripped a `validate="1:1"` join inside
+    `_map_to_thresholds`, so any score column with repeats -- rounded scores, integer
+    scores, credit-style bands -- raised `ComputeError: join keys did not fulfill 1:1
+    validation`.
+    """
+    rand = np.random.RandomState(0)
+    n = 200
+    # Rounding to 2dp guarantees ties: ~89 distinct values across 200 rows.
+    y_score = np.round(rand.rand(n), 2)
+    protected = rand.choice([True, False], n)
+
+    assert len(np.unique(y_score)) < n, "fixture must contain tied scores"
+
+    bs = rapidstats.Bootstrap(iterations=3, seed=208)
+    res = bs.adverse_impact_ratio_at_thresholds(
+        y_score, protected, ~protected, strategy=strategy
+    )
+
+    assert res.height == len(np.unique(y_score))
+    assert res["threshold"].n_unique() == res.height
+
+
+def test_cm_at_thresholds_with_duplicate_user_thresholds():
+    """A caller passing duplicate thresholds should not crash either."""
+    rand = np.random.RandomState(1)
+    n = 200
+    y_true = rand.choice([True, False], n)
+    y_score = rand.rand(n)
+
+    res = rapidstats.metrics.confusion_matrix_at_thresholds(
+        y_true, y_score, thresholds=[0.25, 0.5, 0.5, 0.75], strategy="cum_sum"
+    )
+
+    assert res.height > 0

@@ -15,7 +15,8 @@ pub fn base_confusion_matrix(df: DataFrame) -> DataFrame {
         .unwrap()
 }
 
-pub fn confusion_matrix(base_cm: DataFrame, beta: f64) -> ConfusionMatrixArray {
+/// Weighted counts of the four confusion-matrix cells, indexed by `2*y_true + y_pred`.
+fn base_counts(base_cm: &DataFrame) -> [f64; 4] {
     let mut s = [0.0; 4];
     for (i, w) in base_cm["y"]
         .cast(&DataType::UInt64)
@@ -28,6 +29,42 @@ pub fn confusion_matrix(base_cm: DataFrame, beta: f64) -> ConfusionMatrixArray {
         s[i as usize] += w;
     }
 
+    s
+}
+
+/// Leave-one-out confusion matrices, in O(n) rather than O(n^2).
+///
+/// The confusion matrix is a weighted bincount, so dropping row `i` just removes its
+/// weight from its own cell -- the other three are untouched. Computing the totals once
+/// and subtracting therefore costs O(1) per replicate, where the generic
+/// `bootstrap::run_jacknife` re-filters and re-scans the whole frame for every row.
+///
+/// This is what makes BCa usable at realistic sizes: the jackknife dominated it, growing
+/// 4.5x per doubling of n.
+pub fn jacknife_confusion_matrix(base_cm: &DataFrame, beta: f64) -> Vec<ConfusionMatrixArray> {
+    let totals = base_counts(base_cm);
+
+    base_cm["y"]
+        .cast(&DataType::UInt64)
+        .unwrap()
+        .u64()
+        .unwrap()
+        .into_no_null_iter()
+        .zip(base_cm["sample_weight"].f64().unwrap().into_no_null_iter())
+        .map(|(bin, weight)| {
+            let mut s = totals;
+            s[bin as usize] -= weight;
+
+            confusion_matrix_from_counts(s, beta)
+        })
+        .collect()
+}
+
+pub fn confusion_matrix(base_cm: DataFrame, beta: f64) -> ConfusionMatrixArray {
+    confusion_matrix_from_counts(base_counts(&base_cm), beta)
+}
+
+fn confusion_matrix_from_counts(s: [f64; 4], beta: f64) -> ConfusionMatrixArray {
     let tn = s[0];
     let fp = s[1];
     let fn_ = s[2];
@@ -113,6 +150,7 @@ pub fn bootstrap_confusion_matrix(
     n_jobs: Option<usize>,
     chunksize: Option<usize>,
     poisson: bool,
+    weights: bool,
 ) -> Vec<bootstrap::ConfidenceInterval> {
     let base_cm = base_confusion_matrix(df);
 
@@ -124,46 +162,74 @@ pub fn bootstrap_confusion_matrix(
         n_jobs,
         chunksize,
         poisson,
+        weights,
     );
     let bs_transposed = transpose_confusion_matrix_results(bootstrap_stats);
 
     let original_stat = confusion_matrix(base_cm.clone(), beta);
 
+    // The confusion matrix is a weighted bincount: it always has an answer, even from no
+    // rows (every cell zero, every rate 0/0). So its replicates are never absent, only
+    // undefined -- wrap them as present and let the interval code drop the NaNs.
+    let bs_transposed: Vec<Vec<Option<f64>>> = bs_transposed
+        .into_iter()
+        .map(|bs| bs.into_iter().map(Some).collect())
+        .collect();
+
     if method == "standard" {
         bs_transposed
             .into_iter()
             .zip(original_stat)
-            .map(|(bs, o)| bootstrap::standard_interval(o, bs, alpha))
+            .map(|(bs, o)| bootstrap::standard_interval(Some(o), bs, alpha))
             .collect::<Vec<bootstrap::ConfidenceInterval>>()
     } else if method == "percentile" {
         bs_transposed
             .into_iter()
             .zip(original_stat)
-            .map(|(bs, o)| bootstrap::percentile_interval(o, bs, alpha))
+            .map(|(bs, o)| bootstrap::percentile_interval(Some(o), bs, alpha))
             .collect::<Vec<bootstrap::ConfidenceInterval>>()
     } else if method == "basic" {
         original_stat
             .into_iter()
             .zip(bs_transposed)
-            .map(|(original_stat, bs)| bootstrap::basic_interval(original_stat, bs, alpha))
+            .map(|(original_stat, bs)| bootstrap::basic_interval(Some(original_stat), bs, alpha))
             .collect::<Vec<bootstrap::ConfidenceInterval>>()
     } else if method == "BCa" {
-        let jacknife_stats =
-            bootstrap::run_jacknife(base_cm.clone(), |x| confusion_matrix(x, beta));
-        let js_transposed = transpose_confusion_matrix_results(jacknife_stats);
+        let jacknife_stats = jacknife_confusion_matrix(&base_cm, beta);
+        let js_transposed: Vec<Vec<Option<f64>>> =
+            transpose_confusion_matrix_results(jacknife_stats)
+                .into_iter()
+                .map(|js| js.into_iter().map(Some).collect())
+                .collect();
 
         original_stat
             .into_iter()
             .zip(bs_transposed)
             .zip(js_transposed)
-            .map(|((original_stat, bs), js)| bootstrap::bca_interval(original_stat, bs, js, alpha))
+            .map(|((original_stat, bs), js)| {
+                bootstrap::bca_interval(Some(original_stat), bs, js, alpha)
+            })
             .collect::<Vec<bootstrap::ConfidenceInterval>>()
     } else {
         panic!("Invalid method");
     }
 }
 
-pub fn roc_auc_sorted(df: DataFrame) -> f64 {
+/// Absent is `None`; undefined is `NaN`.
+///
+/// A metric with no rows to read has no answer at all, and that is a null -- polars
+/// spells it `None` here and Python sees `None`. A metric with rows whose formula
+/// divides by zero (`roc_auc` on a single class, `tpr` with no positives) has a real,
+/// undefined answer, and that is `NaN`. Conflating the two hands the caller a float that
+/// looks like a computed result when nothing was computed.
+///
+/// The bootstrap relies on the first half: a resample can come out empty, and those
+/// iterations are skipped rather than poisoning the interval.
+pub fn roc_auc_sorted(df: DataFrame) -> Option<f64> {
+    if df.height() == 0 {
+        return None;
+    }
+
     let y_true = df["y_true"].f64().unwrap();
     let y_score = df["y_score"].f64().unwrap();
     let sample_weight = df["sample_weight"].f64().unwrap();
@@ -207,10 +273,11 @@ pub fn roc_auc_sorted(df: DataFrame) -> f64 {
         i = j;
     }
 
-    auc / (n_false * n_true)
+    // Single-class input leaves one of these at zero: 0/0, genuinely undefined, NaN.
+    Some(auc / (n_false * n_true))
 }
 
-pub fn roc_auc(df: DataFrame) -> f64 {
+pub fn roc_auc(df: DataFrame) -> Option<f64> {
     let df = df.sort(["y_score"], Default::default()).unwrap();
 
     roc_auc_sorted(df)
@@ -265,11 +332,17 @@ fn ks_2samp(v1: &[f64], v2: &[f64]) -> f64 {
     }
 }
 
-pub fn max_ks(df: DataFrame) -> f64 {
+pub fn max_ks(df: DataFrame) -> Option<f64> {
+    if df.height() == 0 {
+        return None;
+    }
+
     let y_score = df["y_score"].f64().unwrap();
     let y_true = df["y_true"].bool().unwrap();
 
-    ks_2samp(
+    // A single-class input leaves one sample empty: the statistic is undefined rather
+    // than absent, so `ks_2samp` returns NaN and that is what comes back.
+    Some(ks_2samp(
         y_score
             .filter(y_true)
             .unwrap()
@@ -282,10 +355,10 @@ pub fn max_ks(df: DataFrame) -> f64 {
             .sort(false)
             .cont_slice()
             .unwrap(),
-    )
+    ))
 }
 
-pub fn brier_loss(df: DataFrame) -> f64 {
+pub fn brier_loss(df: DataFrame) -> Option<f64> {
     df.lazy()
         .with_column((col("y_true") - col("y_score")).pow(2).alias("x"))
         .collect()
@@ -295,14 +368,17 @@ pub fn brier_loss(df: DataFrame) -> f64 {
         .f64()
         .unwrap()
         .mean()
-        .unwrap_or(f64::NAN)
 }
 
-pub fn mean(df: DataFrame) -> f64 {
-    df["y"].as_series().unwrap().mean().unwrap_or(f64::NAN)
+pub fn mean(df: DataFrame) -> Option<f64> {
+    df["y"].as_series().unwrap().mean()
 }
 
-pub fn adverse_impact_ratio(df: DataFrame) -> f64 {
+pub fn adverse_impact_ratio(df: DataFrame) -> Option<f64> {
+    if df.height() == 0 {
+        return None;
+    }
+
     let is_protected = df["protected"].bool().unwrap();
     let is_control = df["control"].bool().unwrap();
     let y_pred = df["y_pred"].f64().unwrap();
@@ -312,46 +388,60 @@ pub fn adverse_impact_ratio(df: DataFrame) -> f64 {
     let control = y_pred.filter(is_control).unwrap();
     let control_sample_weight = sample_weight.filter(is_control).unwrap();
 
-    let protected_approval_rate = (&protected * &protected_sample_weight)
-        .sum()
-        .unwrap_or(f64::NAN)
-        / protected_sample_weight.sum().unwrap_or(f64::NAN);
-    let control_approval_rate = (&control * &control_sample_weight)
-        .sum()
-        .unwrap_or(f64::NAN)
-        / control_sample_weight.sum().unwrap_or(f64::NAN);
+    // `sum()` over an empty ChunkedArray is None, and dividing those unwraps was the
+    // panic path for a fully-filtered input. There are rows here -- just none in this
+    // group -- so the rate is undefined rather than absent.
+    let rate = |weighted: Option<f64>, weight_total: Option<f64>| match (
+        weighted,
+        weight_total,
+    ) {
+        (Some(weighted), Some(total)) => weighted / total,
+        _ => f64::NAN,
+    };
+
+    let protected_approval_rate = rate(
+        (&protected * &protected_sample_weight).sum(),
+        protected_sample_weight.sum(),
+    );
+    let control_approval_rate = rate(
+        (&control * &control_sample_weight).sum(),
+        control_sample_weight.sum(),
+    );
 
     let res = protected_approval_rate / control_approval_rate;
 
-    if res.is_infinite() {
-        f64::NAN
-    } else {
-        res
-    }
+    Some(if res.is_infinite() { f64::NAN } else { res })
 }
 
-pub fn mean_squared_error(df: DataFrame) -> f64 {
+pub fn mean_squared_error(df: DataFrame) -> Option<f64> {
     let y_true = df["y_true"].f64().unwrap();
     let y_score = df["y_score"].f64().unwrap();
 
     let x = &(y_true - y_score);
 
-    (x * x).mean().unwrap()
+    // `mean()` of nothing is None, not a panic and not NaN: there is no error to average.
+    (x * x).mean()
 }
 
-pub fn root_mean_squared_error(df: DataFrame) -> f64 {
-    mean_squared_error(df).sqrt()
+pub fn root_mean_squared_error(df: DataFrame) -> Option<f64> {
+    mean_squared_error(df).map(f64::sqrt)
 }
 
-pub fn r2(df: DataFrame) -> f64 {
+pub fn r2(df: DataFrame) -> Option<f64> {
     let y_true = df["y_true"].f64().unwrap();
     let y_score = df["y_score"].f64().unwrap();
 
+    // No rows, no mean, no R2 -- absent rather than undefined.
+    let mean = y_true.mean()?;
+
     let residual = &(y_true - y_score);
     let squared_residual = residual * residual;
-    let mean = y_true.mean().unwrap();
     let error = &(y_true - mean);
     let squared_error = error * error;
 
-    1.0 - (squared_residual.sum().unwrap() / squared_error.sum().unwrap())
+    // Zero variance in `y_true` makes `total_ss` zero: 1 - 0/0 is undefined, so NaN.
+    match (squared_residual.sum(), squared_error.sum()) {
+        (Some(residual_ss), Some(total_ss)) => Some(1.0 - (residual_ss / total_ss)),
+        _ => None,
+    }
 }

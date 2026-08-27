@@ -4,8 +4,9 @@ import typing
 from typing import Literal
 
 import polars as pl
-from polars.series.series import ArrayLike
 
+from ._typing import ArrayLike
+from ._utils import _collect
 from .bin import auto, doane, freedman_diaconis, rice, scott, sqrt, sturges
 
 BinMethod = Literal["auto", "doane", "fd", "rice", "sturges", "scott", "sqrt"]
@@ -53,13 +54,6 @@ def _psi(
     def _fill_zero(e: pl.Expr, value: float | None) -> pl.Expr:
         return pl.when(e.eq(0)).then(value).otherwise(e)
 
-    major, minor, _ = pl.__version__.split(".")
-
-    if int(major) <= 1 and int(minor) < 24:
-        nulls_equal_kwargs = {"join_nulls": True}
-    else:
-        nulls_equal_kwargs = {"nulls_equal": True}
-
     res = (
         reference_hist.lazy()
         .rename({"count": "reference_count"})
@@ -69,7 +63,7 @@ def _psi(
             how="full",
             validate="1:1",
             coalesce=True,
-            **nulls_equal_kwargs,
+            nulls_equal=True,
         )
         .with_columns(
             pl.col("reference_count", "current_count").fill_null(0),
@@ -94,7 +88,7 @@ def _psi(
         .mul(pl.col("current_pct").truediv(pl.col("reference_pct")).log())
         .sum()
         .alias("res")
-    ).collect()
+    ).pipe(_collect)
 
     return res["res"].item()
 
