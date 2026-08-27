@@ -161,6 +161,24 @@ def _resolve_data(data) -> pl.LazyFrame:
     return nw.from_native(data).to_polars().lazy()
 
 
+def _resolve_thresholds(thresholds, df: pl.DataFrame, column: str) -> set:
+    """The thresholds to evaluate, read from the frame rather than the argument.
+
+    The caller's `y_score` may be a column name when `data=` is given, so the raw argument
+    cannot be iterated -- `set("score")` is five single characters, each then compared
+    against a float column.
+
+    Reading the already-materialised frame is strictly better without `data=` too: it
+    deduplicates, and it drops nulls along with the rest of the frame instead of carrying
+    them into the loop. It also stops the `loop` and `cum_sum` strategies deriving their
+    threshold sets from different sources -- `cum_sum` already reads the frame.
+    """
+    if thresholds is not None:
+        return set(thresholds)
+
+    return set(df[column].unique().to_list())
+
+
 def _column(name, argument: str) -> pl.Expr:
     """A column reference, insisting the caller passed a name rather than an array.
 

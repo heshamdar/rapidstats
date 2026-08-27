@@ -21,6 +21,7 @@ from ._utils import (
     _collect,
     _column,
     _resolve_data,
+    _resolve_thresholds,
     _y_true_y_score_to_lf,
     _fill_infinite,
     _regression_to_df,
@@ -505,7 +506,9 @@ def predicted_positive_ratio_at_thresholds(
                 "ppr": _weighted_mean(df["y_score"].ge(t), df["sample_weight"]),
             }
 
-        return pl.DataFrame(_run_concurrent(_ppr, set(thresholds or y_score)))
+        return pl.DataFrame(
+            _run_concurrent(_ppr, _resolve_thresholds(thresholds, df, "y_score"))
+        )
     elif strategy == "cum_sum":
 
         def _cumulative_ppr(lf: pl.LazyFrame, has_sample_weight: bool):
@@ -754,7 +757,7 @@ def adverse_impact_ratio_at_thresholds(
                 ),
             }
 
-        airs = _run_concurrent(_air, set(thresholds or y_score))
+        airs = _run_concurrent(_air, _resolve_thresholds(thresholds, df, "y_score"))
 
         res = pl.LazyFrame(airs)
     elif strategy == "cum_sum":
@@ -1123,7 +1126,9 @@ def confusion_matrix_at_thresholds(
                 .with_columns(pl.lit(t).alias("threshold"))
             )
 
-        cms: list[pl.DataFrame] = _run_concurrent(_cm, set(thresholds or y_score))
+        cms: list[pl.DataFrame] = _run_concurrent(
+            _cm, _resolve_thresholds(thresholds, df, "y_score")
+        )
 
         return pl.concat(cms, how="vertical").fill_nan(None)
     elif strategy == "cum_sum":

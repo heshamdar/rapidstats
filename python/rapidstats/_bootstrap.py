@@ -39,6 +39,7 @@ from ._utils import (
     _expr_fill_infinite,
     _fill_infinite,
     _regression_to_df,
+    _resolve_thresholds,
     _run_concurrent,
     _y_true_y_pred_to_df,
     _y_true_y_score_to_df,
@@ -819,7 +820,9 @@ class Bootstrap:
 
         if strategy == "loop":
             cms: list[pl.DataFrame] = []
-            for t in tqdm(set(thresholds or y_score)):
+            for t in tqdm(
+                _resolve_thresholds(thresholds, df, "threshold"), disable=self.quiet
+            ):
                 cm = (
                     self.confusion_matrix(
                         df["y_true"],
@@ -1310,7 +1313,9 @@ class Bootstrap:
 
         if strategy == "loop":
             airs: list[dict[str, float]] = []
-            for t in tqdm(set(thresholds or y_score)):
+            for t in tqdm(
+                _resolve_thresholds(thresholds, df, "y_score"), disable=self.quiet
+            ):
                 lower, point, upper = self.adverse_impact_ratio(
                     df["y_score"].lt(t),
                     df["protected"],

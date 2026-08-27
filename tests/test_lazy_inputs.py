@@ -367,3 +367,117 @@ def test_streaming_is_not_slower_on_a_scan_source(wide_parquet):
         f"streaming ({streaming * 1000:.0f}ms) was far slower than in-memory "
         f"({in_memory * 1000:.0f}ms) on a scan source, which is the shape it should win"
     )
+
+
+# ---------------------------------------------------------------------------------
+# `data=` under `strategy="loop"`
+# ---------------------------------------------------------------------------------
+#
+# Five call sites derived their threshold set from `set(thresholds or y_score)`. With
+# `data=`, `y_score` is a column *name*, so that is a set of single characters, each then
+# compared against a float column. The existing `data=` curve tests all pass an explicit
+# `thresholds` list, so `thresholds or y_score` never evaluated `y_score` and the defect
+# passed CI. These omit it.
+#
+# `strategy="loop"` has to be explicit: `_set_loop_strategy` routes
+# `strategy="auto", thresholds=None` to `cum_sum`, which reads the frame already.
+
+LOOP_CASES = [
+    pytest.param(
+        lambda a: rs.metrics.predicted_positive_ratio_at_thresholds(
+            a["y_score"], strategy="loop"
+        ),
+        lambda f: rs.metrics.predicted_positive_ratio_at_thresholds(
+            "y_score", strategy="loop", data=f
+        ),
+        id="predicted_positive_ratio_at_thresholds",
+    ),
+    pytest.param(
+        lambda a: rs.metrics.adverse_impact_ratio_at_thresholds(
+            a["y_score"], a["protected"], a["control"], strategy="loop"
+        ),
+        lambda f: rs.metrics.adverse_impact_ratio_at_thresholds(
+            "y_score", "protected", "control", strategy="loop", data=f
+        ),
+        id="adverse_impact_ratio_at_thresholds",
+    ),
+    pytest.param(
+        lambda a: rs.metrics.confusion_matrix_at_thresholds(
+            a["y_true"], a["y_score"], strategy="loop"
+        ),
+        lambda f: rs.metrics.confusion_matrix_at_thresholds(
+            "y_true", "y_score", strategy="loop", data=f
+        ),
+        id="confusion_matrix_at_thresholds",
+    ),
+    pytest.param(
+        lambda a: rs.Bootstrap(
+            iterations=3, seed=SEED, quiet=True
+        ).confusion_matrix_at_thresholds(a["y_true"], a["y_score"], strategy="loop"),
+        lambda f: rs.Bootstrap(
+            iterations=3, seed=SEED, quiet=True
+        ).confusion_matrix_at_thresholds("y_true", "y_score", strategy="loop", data=f),
+        id="Bootstrap.confusion_matrix_at_thresholds",
+    ),
+]
+
+
+@pytest.mark.parametrize(("from_arrays", "from_data"), LOOP_CASES)
+def test_loop_strategy_accepts_data_without_thresholds(
+    arrays, frame, from_arrays, from_data
+):
+    """The threshold set must come from the frame, not from the `y_score` argument."""
+    expected = from_arrays(arrays).sort(pl.all())
+    actual = from_data(frame.lazy()).sort(pl.all())
+
+    assert actual.height == expected.height
+    assert set(actual["threshold"].to_list()) == set(expected["threshold"].to_list())
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(
+            lambda f, s: rs.metrics.confusion_matrix_at_thresholds(
+                "y_true", "y_score", strategy=s, data=f
+            ),
+            id="confusion_matrix_at_thresholds",
+        ),
+        pytest.param(
+            lambda f, s: rs.metrics.predicted_positive_ratio_at_thresholds(
+                "y_score", strategy=s, data=f
+            ),
+            id="predicted_positive_ratio_at_thresholds",
+        ),
+    ],
+)
+def test_loop_and_cum_sum_resolve_the_same_thresholds(frame, call):
+    """The two strategies compute the same curve, so they must evaluate the same set.
+
+    `cum_sum` always read the frame; `loop` read the raw argument, which also meant it
+    carried duplicates and nulls the frame had already dropped.
+    """
+    loop = call(frame.lazy(), "loop")
+    cum_sum = call(frame.lazy(), "cum_sum")
+
+    assert set(loop["threshold"].to_list()) == set(cum_sum["threshold"].to_list())
+
+
+def test_quiet_silences_the_loop_strategy_bar(arrays, capsys):
+    """The two `strategy="loop"` bars in `_bootstrap.py` never received the flag."""
+    rs.Bootstrap(
+        iterations=3, seed=SEED, n_jobs=1, quiet=True
+    ).confusion_matrix_at_thresholds(
+        arrays["y_true"], arrays["y_score"], thresholds=[0.3, 0.6], strategy="loop"
+    )
+    rs.Bootstrap(
+        iterations=3, seed=SEED, n_jobs=1, quiet=True
+    ).adverse_impact_ratio_at_thresholds(
+        arrays["y_score"],
+        arrays["protected"],
+        arrays["control"],
+        thresholds=[0.3, 0.6],
+        strategy="loop",
+    )
+
+    assert capsys.readouterr().err == "", "progress output leaked despite quiet=True"
