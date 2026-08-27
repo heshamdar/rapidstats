@@ -1339,7 +1339,14 @@ class Bootstrap:
             if self._params["poisson"]:
                 _air_func = _air_at_thresholds_core_sorted
                 _sample_func = functools.partial(_poisson_sample, df_height=df.height)
-                df = df.lazy()
+                # `_air_at_thresholds_core_sorted` reads row position as the rank of
+                # `y_score`, and `_poisson_sample` gathers indices in ascending order --
+                # so sorting once here holds for every iteration. Without it each
+                # resample was scanned unordered while the point estimate came from
+                # `_air_at_thresholds_core`, which sorts: same point, interval measured
+                # 6x to 29x too wide. `confusion_matrix_at_thresholds` sorts its frame
+                # at construction for exactly this reason.
+                df = df.sort("y_score").lazy()
             else:
                 _air_func = _air_at_thresholds_core
                 _sample_func = _multinomial_sample
